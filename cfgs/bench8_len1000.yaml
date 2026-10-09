@@ -1,0 +1,24 @@
+# 8-GPU throughput test on the 1000 episodes listed in outputs/len1000.txt.
+# Cards: segment 1 (3 actors) + inpaint 4 + depth 3 (one cuRobo actor riding on each) = 8.
+name: bench8_len1000
+episodes: outputs/len1000.txt
+out: outputs
+piece_frames: 600
+
+nodes:
+  segment: {cards: 1, actors_per_card: 3}
+  inpaint: {cards: 4}
+  depth: {cards: 3, window: 1, frames_per_forward: 96}
+  action: {ride: depth, actors_per_card: 1, gpu_share: 0.1}
+  render: {actors: 4}
+  cpu: {actors: 8}
+
+io:
+  readers_per_lane: 2
+  queue_per_lane: 4
+  queue_frames: 1200
+
+memory:
+  inflight: 64
+  reserve_gb: 64
+  object_store_gb: 120

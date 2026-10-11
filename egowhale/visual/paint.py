@@ -1,23 +1,19 @@
-"""ProPainter weights and batched inpainting. thirdparty stays unmodified."""
+"""ProPainter weights and batched inpainting, on the mask box of each piece."""
 
 from __future__ import annotations
 
 import os
-import sys
 
 import numpy as np
 
-from egowhale.step import ROOT
+from egowhale import thirdparty
+from egowhale.media import CHUNK, MASK_DILATION, SCALE, dilate_masks, read_chunks, resize_frames
 
-_ROOT = ROOT / "thirdparty" / "propainter"
 _URL = "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/"
-_RESIZE_THREADS = 8
 
 
 def _libs():
-    root = str(_ROOT)
-    if root not in sys.path:
-        sys.path.insert(0, root)
+    thirdparty.use("propainter")
     from inference_propainter import get_ref_index
     from model.misc import get_device
     from model.modules.flow_comp_raft import RAFT_bi
@@ -58,68 +54,97 @@ def load_models(weight_dir: str, device=None):
     return {"raft": raft, "flow": flow, "painter": painter, "device": device, "half": False}
 
 
-def _resize_all(frames: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """PIL's default resize, one thread per frame. PIL drops the GIL while resampling."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    from PIL import Image
-
-    with ThreadPoolExecutor(_RESIZE_THREADS) as pool:
-        return np.stack(list(pool.map(lambda frame: np.asarray(Image.fromarray(frame).resize(size)), frames)))
-
-
-def prepare_clip(frames: np.ndarray, masks: np.ndarray, resize_ratio: float = 0.5, mask_dilation: int = 4) -> dict:
+def prepare_clip(frames: np.ndarray, masks: np.ndarray, resize_ratio: float = SCALE, mask_dilation: int = MASK_DILATION) -> dict:
     """Resize and dilate on the CPU dataloader. Pixels stay uint8 until they reach the GPU."""
-    import cv2
-    import scipy.ndimage
     import torch
 
     height, width = frames.shape[1], frames.shape[2]
-    # Same sizes as ProPainter's resize_frames: process size is the output size rounded down to a multiple of 8.
-    out_size = (int(width * resize_ratio), int(height * resize_ratio))
-    process_w, process_h = out_size[0] - out_size[0] % 8, out_size[1] - out_size[1] % 8
-    resized = _resize_all(frames, (process_w, process_h))
-    dilated = []
-    for mask in masks:
-        image = cv2.resize(mask.astype(np.uint8), (process_w, process_h), interpolation=cv2.INTER_NEAREST)
-        if mask_dilation > 0:
-            image = scipy.ndimage.binary_dilation(image, iterations=mask_dilation).astype(np.uint8)
-        else:
-            image = (image > 0).astype(np.uint8)
-        dilated.append(image)
+    out_size, process = _sizes(width, height, resize_ratio)
     return {
-        "frames": torch.from_numpy(resized).permute(0, 3, 1, 2).unsqueeze(0).contiguous(),
-        "masks": torch.from_numpy(np.stack(dilated)).unsqueeze(1).unsqueeze(0),
-        "original": resized,
+        "frames": torch.from_numpy(resize_frames(frames, process)).permute(0, 3, 1, 2).unsqueeze(0).contiguous(),
+        "masks": dilate_masks(masks, process, mask_dilation),
         "out_size": out_size,
-        "key": (process_w, process_h, len(resized)),
+        "key": (*process, len(frames)),
     }
 
 
-def prepare_crop(frames: np.ndarray, masks: np.ndarray, margin: float = 0.05, resize_ratio: float = 0.5) -> dict:
-    """Paint only the clip's mask box plus a margin. One box for the whole clip keeps flow coordinates fixed."""
+def crop_box(masks: np.ndarray, margin: float = 0.05) -> tuple[int, int, int, int]:
+    """The clip's mask box plus a margin, as y0, y1, x0, x1 on 16-pixel edges. One box keeps flow coordinates fixed."""
     height, width = masks.shape[1:]
     ys, xs = np.where(masks.any(0))
     if len(ys) == 0:
-        y0, y1, x0, x1 = 0, height, 0, width
-    else:
-        pad = int(margin * max(height, width))
-        y0 = max(0, (ys.min() - pad) // 16 * 16)
-        x0 = max(0, (xs.min() - pad) // 16 * 16)
-        y1 = min(height, -(-(ys.max() + 1 + pad) // 16) * 16)
-        x1 = min(width, -(-(xs.max() + 1 + pad) // 16) * 16)
-    clip = prepare_clip(np.ascontiguousarray(frames[:, y0:y1, x0:x1]), masks[:, y0:y1, x0:x1], resize_ratio)
-    size = (int(width * resize_ratio), int(height * resize_ratio))
-    clip["background"] = _resize_all(frames, size)
-    clip["box"] = (int(y0 * resize_ratio), int(x0 * resize_ratio))
-    return clip
+        return 0, height, 0, width
+    pad = int(margin * max(height, width))
+    y0 = max(0, (ys.min() - pad) // 16 * 16)
+    x0 = max(0, (xs.min() - pad) // 16 * 16)
+    y1 = min(height, -(-(ys.max() + 1 + pad) // 16) * 16)
+    x1 = min(width, -(-(xs.max() + 1 + pad) // 16) * 16)
+    return int(y0), int(y1), int(x0), int(x1)
 
 
-def paste(background: np.ndarray, painted: np.ndarray, box: tuple[int, int]) -> np.ndarray:
-    out = np.array(background)
+def prepare_crop(video, start: int, stop: int, masks: np.ndarray, resize_ratio: float = SCALE, chunk: int = CHUNK) -> dict:
+    """Decode frames [start, stop) a chunk at a time, keeping only the resized mask box.
+
+    The full frames are never held for the whole piece, and the background is not kept: the writer
+    decodes it again when it pastes the painted box back.
+    """
+    import torch
+
+    y0, y1, x0, x1 = crop_box(masks)
+    out_size, process = _sizes(x1 - x0, y1 - y0, resize_ratio)
+    resized = np.empty((stop - start, process[1], process[0], 3), dtype=np.uint8)
+    count = 0
+    fps = 30.0
+    for fps, block in read_chunks(video, start, stop, chunk):
+        resized[count : count + len(block)] = resize_frames(np.ascontiguousarray(block[:, y0:y1, x0:x1]), process)
+        count += len(block)
+    if count != len(masks):
+        raise ValueError(f"{count} frames vs {len(masks)} masks")
+    return {
+        "frames": torch.from_numpy(resized).permute(0, 3, 1, 2).unsqueeze(0).contiguous(),
+        "masks": dilate_masks(masks[:, y0:y1, x0:x1], process),
+        "out_size": out_size,
+        "key": (*process, count),
+        "box": (int(y0 * resize_ratio), int(x0 * resize_ratio)),
+        "fps": float(fps),
+    }
+
+
+def write_painted(
+    path, video, start: int, stop: int, painted: np.ndarray, box: tuple[int, int] | None, resize_ratio: float = SCALE, chunk: int = CHUNK
+) -> None:
+    """Paste the painted box into the resized source frames and write the video, a chunk at a time.
+
+    With no box the painted frames are whole frames and are written as they are; the source is not decoded.
+    """
+    from egowhale.media import RgbWriter, video_shape
+
+    if box is None:
+        with RgbWriter(path, video_shape(video)[3]) as writer:
+            writer.write(painted)
+        return
     top, left = box
-    out[:, top : top + painted.shape[1], left : left + painted.shape[2]] = painted
-    return out
+    writer = None
+    done = 0
+    try:
+        for fps, block in read_chunks(video, start, stop, chunk):
+            if writer is None:
+                writer = RgbWriter(path, fps)
+            height, width = block.shape[1:3]
+            background = resize_frames(block, (int(width * resize_ratio), int(height * resize_ratio)))
+            part = painted[done : done + len(background)]
+            background[: len(part), top : top + part.shape[1], left : left + part.shape[2]] = part
+            writer.write(background)
+            done += len(background)
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+def _sizes(width: int, height: int, resize_ratio: float) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Output size, and ProPainter's process size: the output size rounded down to a multiple of 8."""
+    out_size = (int(width * resize_ratio), int(height * resize_ratio))
+    return out_size, (out_size[0] - out_size[0] % 8, out_size[1] - out_size[1] % 8)
 
 
 def paint_clips(models, clips: list[dict], ref_stride=10, neighbor_length=10, subvideo_length=80, raft_iter=20, fp16=True):
@@ -136,7 +161,6 @@ def paint_clips(models, clips: list[dict], ref_stride=10, neighbor_length=10, su
             models,
             torch.cat([clip["frames"] for clip in group], dim=0),
             torch.cat([clip["masks"] for clip in group], dim=0),
-            [clip["original"] for clip in group],
             [clip["out_size"] for clip in group],
             ref_stride=ref_stride,
             neighbor_length=neighbor_length,
@@ -149,7 +173,7 @@ def paint_clips(models, clips: list[dict], ref_stride=10, neighbor_length=10, su
     return painted
 
 
-def _forward(models, frames, masks, originals, out_sizes, ref_stride, neighbor_length, subvideo_length, raft_iter, fp16):
+def _forward(models, frames, masks, out_sizes, ref_stride, neighbor_length, subvideo_length, raft_iter, fp16):
     import cv2
     import torch
 
@@ -157,7 +181,8 @@ def _forward(models, frames, masks, originals, out_sizes, ref_stride, neighbor_l
     # ProPainter's to_tensors maps pixels to [-1, 1] on the CPU. GPU division rounds differently in the last bit,
     # so the 256 CPU results are looked up instead of recomputed.
     table = (torch.arange(256, dtype=torch.float32).div(255) * 2 - 1).to(device)
-    frames = table[frames.to(device).long()]
+    pixels = frames
+    frames = table[pixels.to(device).long()]
     masks = masks.to(device).float()
     flow_masks = masks
     batch, video_length, _, height, width = frames.shape
@@ -193,12 +218,14 @@ def _forward(models, frames, masks, originals, out_sizes, ref_stride, neighbor_l
             flow_masks = flow_masks.half()
             masks = masks.half()
             flows = (flows[0].half(), flows[1].half())
-            if not models["half"]:
-                models["flow"] = flow.half()
-                models["painter"] = painter.half()
-                flow = models["flow"]
-                painter = models["painter"]
-                models["half"] = True
+        # The shared weights follow this call's precision, so a later fp32 call does not meet half weights.
+        if models["half"] != use_half:
+            cast = (lambda module: module.half()) if use_half else (lambda module: module.float())
+            models["flow"] = cast(flow)
+            models["painter"] = cast(painter)
+            flow = models["flow"]
+            painter = models["painter"]
+            models["half"] = use_half
 
         flow_length = flows[0].size(1)
         if flow_length > subvideo_length:
@@ -244,7 +271,8 @@ def _forward(models, frames, masks, originals, out_sizes, ref_stride, neighbor_l
 
     stride = neighbor_length // 2
     ref_num = subvideo_length // ref_stride if video_length > subvideo_length else -1
-    base = torch.from_numpy(np.stack(originals)).to(device)
+    # The uint8 input, channels last, is what unmasked pixels keep in the output.
+    base = pixels.permute(0, 1, 3, 4, 2).to(device).contiguous()
     composite = torch.zeros_like(base)
     filled = torch.zeros(video_length, dtype=torch.bool, device=device)
     for start in range(0, video_length, stride):

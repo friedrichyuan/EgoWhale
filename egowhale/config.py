@@ -10,7 +10,13 @@ from pathlib import Path
 
 import yaml
 
-from egowhale.step import PIECE, ROOT
+from egowhale.paths import ROOT
+from egowhale.pieces import PIECE
+
+
+class ConfigError(ValueError):
+    """A config that cannot run. The command line prints it and exits."""
+
 
 DEFAULTS = {
     "name": "run",
@@ -20,13 +26,16 @@ DEFAULTS = {
     "out": "outputs",
     # 0 runs every episode.
     "limit": 0,
+    # "list" keeps the listed order; "shuffle" mixes long and short episodes evenly, with `seed`.
+    "order": "list",
+    "seed": 0,
     # Longer episodes are split into equal pieces of at most this many frames.
     "piece_frames": PIECE,
     "nodes": {
         # SAM 3 + Cutie. Actors on one card share it evenly.
         "segment": {"cards": 1, "actors_per_card": 1},
-        # ProPainter, one actor per card.
-        "inpaint": {"cards": 1},
+        # One actor per card. `model`: sttn (fast) or propainter (slower, sharper).
+        "inpaint": {"cards": 1, "model": "sttn"},
         # DA3-GIANT. `window` views share one DA3 call; `frames_per_forward` frames go in one forward.
         "depth": {"cards": 1, "window": 1, "frames_per_forward": 96},
         # cuRobo. `ride: inpaint|depth` puts `actors_per_card` actors on every card of that node,
@@ -67,12 +76,16 @@ def load(path: Path | str, **overrides) -> dict:
         if value is not None:
             config[key] = value
     if not config["episodes"]:
-        raise SystemExit(f"{path}: no episodes")
+        raise ConfigError(f"{path}: no episodes")
+    from egowhale.visual.inpaint import MODELS
+
+    if config["nodes"]["inpaint"]["model"] not in MODELS:
+        raise ConfigError(f"{path}: nodes.inpaint.model must be one of {', '.join(MODELS)}")
     action = config["nodes"]["action"]
     if action["ride"] not in (None, "inpaint", "depth"):
-        raise SystemExit(f"{path}: nodes.action.ride must be inpaint, depth, or empty")
+        raise ConfigError(f"{path}: nodes.action.ride must be inpaint, depth, or empty")
     if action["ride"] and action["actors_per_card"] * action["gpu_share"] >= 1:
-        raise SystemExit(f"{path}: riding action actors would take the whole card")
+        raise ConfigError(f"{path}: riding action actors would take the whole card")
     config["out"] = str(_resolve(config["out"]) / config["name"])
     config["source"] = str(path.resolve())
     return config
@@ -89,6 +102,12 @@ def episodes(config: dict) -> list[Path]:
             found.extend(sorted(item for item in path.rglob("*.hdf5") if item.with_suffix(".mp4").is_file()))
         else:
             found.append(path)
+    if config["order"] == "shuffle":
+        import random
+
+        random.Random(config["seed"]).shuffle(found)
+    elif config["order"] != "list":
+        raise ConfigError(f"order must be list or shuffle, not {config['order']}")
     if config["limit"]:
         found = found[: config["limit"]]
     return [path.resolve() for path in found]
@@ -102,7 +121,7 @@ def _resolve(value) -> Path:
 def _merge(base: dict, given: dict, where: str) -> dict:
     for key, value in given.items():
         if key not in base:
-            raise SystemExit(f"unknown config key {where}{key}")
+            raise ConfigError(f"unknown config key {where}{key}")
         if isinstance(base[key], dict) and base[key] and isinstance(value, dict):
             _merge(base[key], value, f"{where}{key}.")
         else:

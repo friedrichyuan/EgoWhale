@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-
-os.environ.setdefault("MUJOCO_GL", "egl")
 
 import mujoco
 import numpy as np
 import torch
 
-from egowhale.action.base_ik import ARM, GRIPPERS, SCENE, _robot_yaml
-from egowhale.step import IK, PREFIX, Step
-
-_FPS = 30.0
+from egowhale.media import FPS
+from egowhale.paths import IK, PREFIX
+from egowhale.robot import ARM, GRIPPERS, SCENE, robot_yaml
+from egowhale.step import Step
 
 
 class Approach(Step):
@@ -24,9 +21,15 @@ class Approach(Step):
     gpus = 1
 
     def run(self, src: Path, dst: Path) -> None:
-        prefix = self.compute(read_ik(Path(dst)))
-        save_prefix(Path(dst), prefix)
-        print(f"  approach {len(prefix['qpos'])} frames  {(len(prefix['qpos']) - 1) / _FPS:.2f}s")
+        prefix = self.compute(self.read(src, dst))
+        self.save(dst, prefix)
+        print(f"  approach {len(prefix['qpos'])} frames  {(len(prefix['qpos']) - 1) / FPS:.2f}s")
+
+    def read(self, src: Path, dst: Path) -> dict:
+        return read_ik(Path(dst))
+
+    def save(self, dst: Path, out: dict) -> None:
+        save_prefix(Path(dst), out)
 
     def compute(self, data: dict) -> dict:
         qpos = data["qpos"]
@@ -40,7 +43,7 @@ class Approach(Step):
         grip = _match_arrival(_ease(len(arm)) * grip_goal, grip_goal, grip_step)
         prefix = np.zeros((len(arm), model.nq), dtype=np.float32)
         _write(model, ARM, arm, prefix)
-        _write(model, _gripper_names(), grip, prefix)
+        _write(model, grip_names, grip, prefix)
         return {"qpos": prefix}
 
 
@@ -60,7 +63,7 @@ def _trajopt(goal: np.ndarray) -> np.ndarray:
 
     torch.set_default_dtype(torch.float32)
     solver = TrajectoryOptimizer(TrajectoryOptimizerCfg.create(
-        robot=_robot_yaml(),
+        robot=robot_yaml(),
         num_seeds=4,
         self_collision_check=False,
         load_collision_spheres=False,
@@ -78,7 +81,7 @@ def _trajopt(goal: np.ndarray) -> np.ndarray:
         position = position[0]
     dt = float(result.js_solution.dt.detach().float().cpu().reshape(-1)[0])
     samples = np.arange(len(position)) * dt
-    query = np.linspace(0.0, samples[-1], max(2, int(round(samples[-1] * _FPS)) + 1))
+    query = np.linspace(0.0, samples[-1], max(2, int(round(samples[-1] * FPS)) + 1))
     arm = np.stack([np.interp(query, samples, position[:, index]) for index in range(position.shape[1])], axis=1)
     arm = arm[:, [names.index(name) for name in ARM]]
     arm[-1] = goal

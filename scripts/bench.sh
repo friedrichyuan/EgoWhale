@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
-# Throughput benchmark on 8 GPUs: segment 1 card x 3 actors, inpaint 4 cards with one action actor
-# riding on two of them, depth 3 cards, 4 MuJoCo render actors. Episodes are the first 1000 of 11 EgoDex tasks.
+# Throughput benchmark on 8 GPUs with the node layout in cfgs/bench8_len1000.yaml: segment 1 card x 3 actors,
+# inpaint 4 cards, depth 3 cards with one cuRobo actor riding on each, 4 MuJoCo render actors.
+# Episodes are the config's list: outputs/len1000.txt, the designed mix of 1000 test episodes from 106 tasks.
 # Writes to a fresh out_dir, including TensorBoard in tb/ and 0.5 s GPU utilization in gpu.csv.
-# Usage: scripts/bench.sh <egodex_test_dir> <out_dir> [extra batch flags, e.g. --limit 200]
+# Usage: [EGOWHALE_BENCH_CONFIG=cfgs/....yaml] scripts/bench.sh <out_dir> [extra batch flags, e.g. --limit 200]
+# Pass --episodes <list.txt> to run a rebased copy of the list where the dataset lives elsewhere.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-data=$(realpath "$1")
-out=$2
-shift 2
+out=$(realpath -m "$1")
+shift
 if [ -e "$out" ]; then
     echo "$out exists; finished stages would be skipped" >&2
     exit 1
 fi
-tasks=(
-    basic_pick_place vertical_pick_place assemble_disassemble_furniture_bench_chair stack_unstack_plates
-    insert_remove_furniture_bench_cabinet stack basic_fold scoop_dump_ice charge_uncharge_device
-    use_rubiks_cube pick_place_food
-)
 mkdir -p "$out"
 # Containers started with NVIDIA_DRIVER_CAPABILITIES=compute,utility have libEGL_nvidia but do not register it,
 # so EGL only offers Mesa's software device.
@@ -31,6 +27,6 @@ nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,
 sampler=$!
 trap 'kill $sampler' EXIT
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
-python -m egowhale.batch "${tasks[@]/#/$data/}" --out "$out" --limit 1000 \
-    --segment 1 --segment-actors 3 --inpaint 4 --action 0 --action-actors 2 --depth 3 --render 4 "$@" \
+python -m egowhale.batch "${EGOWHALE_BENCH_CONFIG:-cfgs/bench8_len1000.yaml}" \
+    --out "$(dirname "$out")" --name "$(basename "$out")" "$@" \
     2>&1 | tee "$out/batch.log"

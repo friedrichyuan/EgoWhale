@@ -2,33 +2,31 @@
 
 from __future__ import annotations
 
-import sys
+import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+from egowhale import thirdparty
 from egowhale.media import read_rgb, save_masks
-from egowhale.step import MASKS, ROOT, Step, compute_lock, piece_dir, pieces
+from egowhale.paths import MASKS, THIRDPARTY
+from egowhale.step import Result, Step, failed_items, short_error
 
-_SAM3 = ROOT / "thirdparty" / "sam3"
-_CKPT = _SAM3 / "weights" / "sam3" / "sam3.pt"
-_BPE = _SAM3 / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-_CUTIE_PKG = ROOT / "thirdparty" / "cutie"
-_CUTIE = _CUTIE_PKG / "weights" / "cutie-base-mega.pth"
+_CKPT = THIRDPARTY / "sam3" / "weights" / "sam3" / "sam3.pt"
+_BPE = THIRDPARTY / "sam3" / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+_CUTIE = THIRDPARTY / "cutie" / "weights" / "cutie-base-mega.pth"
 _KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+# Every _STRIDE-th frame is a SAM 3 keyframe; Cutie carries the mask between them at _SHORT pixels on the short side.
 _STRIDE = 10
 _SHORT = 480
 
 
 def load_tracker():
     """Official SAM 3 image model and Cutie. EfficientSAM3 must not share this process."""
-    root = str(_SAM3)
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    psutil = Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages" / "ray" / "thirdparty_files"
-    if psutil.is_dir() and str(psutil) not in sys.path:
-        sys.path.insert(0, str(psutil))
+    if not _CKPT.is_file():
+        raise FileNotFoundError(_CKPT)
+    thirdparty.use_sam3()
     from sam3.model.sam3_image_processor import Sam3Processor
     from sam3.model_builder import build_sam3_image_model
 
@@ -46,14 +44,13 @@ def _load_cutie():
     import torch
     from omegaconf import OmegaConf
 
-    pkg = str(_CUTIE_PKG)
-    if pkg not in sys.path:
-        sys.path.insert(0, pkg)
+    thirdparty.use("cutie")
     import tracker.model.utils.resnet as resnet
     from tracker.config import CONFIG
     from tracker.inference.inference_core import InferenceCore
     from tracker.model.cutie import CUTIE
 
+    # Cutie's backbones would download ImageNet weights that its own checkpoint then replaces.
     resnet.resnet18 = lambda pretrained=True, extra_dim=0: resnet.ResNet(resnet.BasicBlock, [2, 2, 2, 2], extra_dim)
     resnet.resnet50 = lambda pretrained=True, extra_dim=0: resnet.ResNet(resnet.Bottleneck, [3, 4, 6, 3], extra_dim)
     cfg = OmegaConf.create(CONFIG)
@@ -68,59 +65,57 @@ class Segment(Step):
     name = "segment"
     makes = (MASKS,)
     gpus = 1
+    per_piece = True
 
-    def run(self, src: Path, dst: Path) -> None:
+    def __init__(self) -> None:
+        super().__init__()
+        self.processor = None
+        self.cutie = None
+
+    def load(self) -> None:
+        if self.processor is None:
+            self.processor, self.cutie = load_tracker()
+
+    def release(self) -> None:
+        self.processor = self.cutie = None
+
+    def run_piece(self, src: Path, dst: Path, index: int) -> None:
+        item = self.prepare(src, *self.piece(dst, index))
+        self.load()
+        save_masks(Path(item["dst"]), segment_video(self.processor, self.cutie, item["frames"]))
+
+    def prepare(self, src: Path, where: Path, start: int, stop: int) -> dict:
+        """The piece's frames at full size, for a CPU reader."""
         video = Path(src).with_suffix(".mp4")
         if not video.is_file():
             raise FileNotFoundError(video)
-        if not _CKPT.is_file():
-            raise FileNotFoundError(_CKPT)
-        processor = getattr(self, "_processor", None)
-        cutie = getattr(self, "_cutie", None)
-        own = processor is None
-        if own:
-            processor, cutie = load_tracker()
-        try:
-            spans = pieces(dst)
-            for index, (start, stop) in enumerate(spans):
-                path = piece_dir(dst, index, len(spans)) / MASKS
-                if path.is_file():
-                    continue
-                frames, _fps = read_rgb(video, start, stop)
-                save_masks(path, segment_video(processor, cutie, frames))
-        finally:
-            if own:
-                del processor, cutie
+        frames, _fps = read_rgb(video, start, stop)
+        return {"frames": frames, "dst": str(Path(where) / MASKS)}
 
-    def consume(self, payload: dict) -> dict:
-        """Segment prefetched frames. Masks go back for a CPU process to store."""
-        import time
-
+    def consume(self, payload: dict, budget: int | None = None) -> dict:
+        """Segment prefetched pieces one at a time. Masks go back for a CPU writer; `budget` is unused."""
         import ray
 
-        results = []
+        items = payload["items"]
+        results = failed_items(items)
         saves = []
-        processor = getattr(self, "_processor", None)
-        cutie = getattr(self, "_cutie", None)
-        if processor is None:
-            processor, cutie = load_tracker()
-            self._processor = processor
-            self._cutie = cutie
-        lock = compute_lock(self)
-        with lock:
-            for item in payload["items"]:
-                if not item.get("ok"):
-                    results.append((False, 0.0, item.get("error") or "feed failed"))
+        self.load()
+        with self.lock:
+            for index, item in enumerate(items):
+                if results[index] is not None:
                     continue
                 started = time.perf_counter()
                 try:
-                    masks = segment_video(processor, cutie, item["frames"])
+                    masks = segment_video(self.processor, self.cutie, item["frames"])
                 except Exception as exc:
-                    results.append((False, 0.0, str(exc).splitlines()[-1]))
+                    results[index] = Result(False, 0.0, short_error(exc))
                     continue
-                results.append((True, time.perf_counter() - started, ""))
-                saves.append({"kind": "masks", "path": item["dst"], "data": masks})
-        return {"results": results, "save_ref": ray.put(saves) if saves else None}
+                results[index] = Result(True, time.perf_counter() - started)
+                saves.append({"stage": self.name, "dst": item["dst"], "masks": masks})
+        return {"results": results, "budget": budget, "save_ref": ray.put(saves) if saves else None}
+
+    def store(self, save: dict) -> None:
+        save_masks(Path(save["dst"]), save["masks"])
 
 
 def segment_video(processor, cutie, frames: np.ndarray) -> np.ndarray:

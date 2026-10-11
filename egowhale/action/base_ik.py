@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
-
-os.environ.setdefault("MUJOCO_GL", "egl")
 
 import mujoco
 import numpy as np
@@ -15,32 +11,15 @@ import torch
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
 
-from egowhale.step import BASE, GRIPPER, IK, ROOT, Step
-
-ARM = (
-    "left_joint1",
-    "left_joint2",
-    "left_joint3",
-    "left_joint4",
-    "left_joint5",
-    "left_joint6",
-    "right_joint11",
-    "right_joint12",
-    "right_joint13",
-    "right_joint14",
-    "right_joint15",
-    "right_joint16",
-)
-GRIPPERS = (("left_joint7", "left_joint8"), ("right_joint17", "right_joint18"))
-TCP = ("left_tcp", "right_tcp")
-SCENE = ROOT / "assets" / "mujoco_arx_scene" / "scene.xml"
-URDF = ROOT / "assets" / "curobo_arx" / "arx_acone_kin.urdf"
-YAML = ROOT / "assets" / "curobo_arx" / "arx_acone.yml"
+from egowhale.media import FPS
+from egowhale.paths import BASE, GRIPPER, IK
+from egowhale.robot import ARM, GRIPPERS, SCENE, TCP, robot_yaml
+from egowhale.step import Step
 
 # OpenCV camera (x right, y down, z forward) from robot (x forward, y left, z up).
 _R_CAM_ROBOT = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]], dtype=np.float64)
 _REACH = 0.855
-_DT = 1.0 / 30.0
+_DT = 1.0 / FPS
 _BOUND = np.array([0.30, 0.30, 0.20, np.deg2rad(35.0)], dtype=np.float64)
 _SEEDS = 2
 _STEPS = 120
@@ -53,10 +32,16 @@ class BaseIK(Step):
     gpus = 1
 
     def run(self, src: Path, dst: Path) -> None:
-        result = self.compute(read_gripper(Path(dst)))
-        save_base(Path(dst), result)
+        result = self.compute(self.read(src, dst))
+        self.save(dst, result)
         losses = result["losses"]
         print(f"  pos {losses['position'] * 1000:.1f} mm  jerk {losses['jerk']:.4f}")
+
+    def read(self, src: Path, dst: Path) -> dict:
+        return read_gripper(Path(dst))
+
+    def save(self, dst: Path, out: dict) -> None:
+        save_base(Path(dst), out)
 
     def compute(self, data: dict) -> dict:
         matrix, qpos, losses = _solve(data["position"], data["rotation"], data["width"], data["valid"])
@@ -88,7 +73,7 @@ def _solve(position, rotation, width, valid):
     seed_r, seed_t = _seed_pose(position, valid)
     goal_p, goal_r = _hold(position, rotation, valid)
     offsets = _offset_grid()
-    robot = _robot_yaml()
+    robot = robot_yaml()
     kin = Kinematics(KinematicsCfg.from_robot_yaml_file(robot, tool_frames=list(TCP)))
     ik = InverseKinematics(
         InverseKinematicsCfg.create(
@@ -357,12 +342,3 @@ def _wxyz_pair(position, rotation):
     xyzw = Rotation.from_matrix(rotation.reshape(-1, 3, 3)).as_quat()
     quat = xyzw.reshape(rotation.shape[:-2] + (4,))[..., [3, 0, 1, 2]]
     return position, quat
-
-
-def _robot_yaml() -> str:
-    text = YAML.read_text(encoding="utf-8")
-    text = text.replace('urdf_path: "arx_acone_kin.urdf"', f'urdf_path: "{URDF}"')
-    text = text.replace('asset_root_path: ""', f'asset_root_path: "{URDF.parent}"')
-    path = Path(tempfile.gettempdir()) / "egowhale_arx.yml"
-    path.write_text(text, encoding="utf-8")
-    return str(path)

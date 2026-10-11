@@ -1,0 +1,25 @@
+# 8-GPU layout for STTN inpainting, to compare with bench8_len1000 (sized when ProPainter needed 4 cards).
+# STTN paints about ten times faster, so two inpaint cards go to segment, which becomes the slowest visual stage.
+# Cards: segment 3 (2 actors each) + inpaint 2 + depth 3 (one cuRobo actor riding on each) = 8.
+name: bench8_sttn
+episodes: outputs/len1000.txt
+out: outputs
+piece_frames: 600
+
+nodes:
+  segment: {cards: 3, actors_per_card: 2}
+  inpaint: {cards: 2, model: sttn}
+  depth: {cards: 3, window: 1, frames_per_forward: 96}
+  action: {ride: depth, actors_per_card: 1, gpu_share: 0.1}
+  render: {actors: 4}
+  cpu: {actors: 8}
+
+io:
+  readers_per_lane: 2
+  queue_per_lane: 4
+  queue_frames: 1200
+
+memory:
+  inflight: 64
+  reserve_gb: 64
+  object_store_gb: 120

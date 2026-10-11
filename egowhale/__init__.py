@@ -1,5 +1,11 @@
-"""EgoDex video to robot frames: retarget, segment, inpaint, base+IK, composite."""
+"""EgoDex video to dual-arm robot demonstrations: retarget, segment, inpaint, depth, base+IK, approach, render,
+composite, and curate."""
 
-from .step import run, run_remote
+import os
 
-__all__ = ["run", "run_remote"]
+# MuJoCo picks its GL backend when it is first imported, and every stage that renders imports this package first.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+from .step import Result, Step, run  # noqa: E402
+
+__all__ = ["Result", "Step", "run"]

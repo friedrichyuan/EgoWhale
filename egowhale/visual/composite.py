@@ -8,7 +8,9 @@ import cv2
 import numpy as np
 
 from egowhale.media import RgbWriter, load_masks, read_rgb
-from egowhale.step import COMPOSITE, DEPTH, INPAINT, MASKS, PREFIX, RENDER, Step, piece_dir, pieces
+from egowhale.paths import COMPOSITE, DEPTH, INPAINT, MASKS, PREFIX, RENDER
+from egowhale.pieces import piece_dir, pieces
+from egowhale.step import Step
 from egowhale.visual.render import load_render
 
 _HAND_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))

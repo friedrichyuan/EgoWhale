@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-import sys
+import time
 from pathlib import Path
 
 import cv2
 import h5py
 import numpy as np
 
-from egowhale.media import read_rgb
-from egowhale.step import DEPTH, ROOT, SCALE, Step, compute_lock, piece_dir, pieces
+from egowhale import thirdparty
+from egowhale.media import SCALE, frame_size, read_rgb, save_depth
+from egowhale.paths import DEPTH, THIRDPARTY
+from egowhale.step import Result, Step, failed_items, run_grouped
 
-_SRC = ROOT / "thirdparty" / "da3" / "src"
-_WEIGHTS = ROOT / "thirdparty" / "da3" / "weights" / "DA3-GIANT"
+_WEIGHTS = THIRDPARTY / "da3" / "weights" / "DA3-GIANT"
 PROCESS_RES = 336
 # Views per DA3 window. Depth only orders the gripper against the hand and objects in the same frame,
 # so frames need no shared context. On a 4090, 1-view windows ran at 34-35 fps, 4-view at 32-33, 64-view at 17.
@@ -29,82 +30,63 @@ class Depth(Step):
     name = "depth"
     makes = (DEPTH,)
     gpus = 1
-    window = WINDOW
+    per_piece = True
 
-    def run(self, src: Path, dst: Path) -> None:
-        if not (_WEIGHTS / "model.safetensors").is_file():
-            raise FileNotFoundError(_WEIGHTS)
-        own = getattr(self, "_model", None) is None
-        if own:
-            self._model = load_model()
-        try:
-            spans = pieces(dst)
-            for index, (start, stop) in enumerate(spans):
-                path = piece_dir(dst, index, len(spans)) / DEPTH
-                if path.is_file():
-                    continue
-                frames, _fps = read_rgb(Path(src).with_suffix(".mp4"), start, stop)
-                item = prepare_view(Path(src), frames, start)
-                item.update(ok=True, dst=str(path))
-                results, saves, _limit = self.estimate([item], BUDGET)
-                if not results[0][0]:
-                    raise RuntimeError(results[0][2])
-                _store_depth(path, saves[0]["data"])
-                print(f"  depth median {float(np.median(saves[0]['data'])):.3f} m")
-        finally:
-            if own:
-                del self._model
+    def __init__(self, window: int = WINDOW) -> None:
+        super().__init__()
+        self.window = window
+        self.model = None
 
-    def consume(self, payload: dict, budget: int) -> dict:
+    def load(self) -> None:
+        if self.model is None:
+            self.model = load_model()
+
+    def release(self) -> None:
+        self.model = None
+
+    def prepare(self, src: Path, where: Path, start: int, stop: int) -> dict:
+        """The piece resized for DA3, with its cameras and hand joints, for a CPU reader. Reads the source video."""
+        frames, _fps = read_rgb(Path(src).with_suffix(".mp4"), start, stop)
+        view = prepare_view(Path(src), frames, start)
+        view["dst"] = str(Path(where) / DEPTH)
+        return view
+
+    def run_piece(self, src: Path, dst: Path, index: int) -> None:
+        item = self.prepare(src, *self.piece(dst, index))
+        item["ok"] = True
+        results, saves, _limit = self.estimate([item], BUDGET)
+        if not results[0].ran:
+            raise RuntimeError(results[0].error)
+        self.store(saves[0])
+        print(f"  depth median {float(np.median(saves[0]['depth'])):.3f} m")
+
+    def consume(self, payload: dict, budget: int | None = None) -> dict:
         import ray
 
-        results, saves, limit = self.estimate(payload["items"], budget)
+        results, saves, limit = self.estimate(payload["items"], budget or BUDGET)
         return {"results": results, "budget": limit, "save_ref": ray.put(saves) if saves else None}
+
+    def store(self, save: dict) -> None:
+        save_depth(Path(save["dst"]), save["depth"])
 
     def estimate(self, items: list[dict], budget: int) -> tuple[list, list, int]:
         """Cut every piece into windows, forward equal windows together, join each piece back. OOM halves the budget."""
-        import time
-
-        import torch
-
-        results = [None] * len(items)
-        for index, item in enumerate(items):
-            if not item.get("ok"):
-                results[index] = (False, 0.0, item.get("error") or "feed failed")
+        results = failed_items(items)
         views = [(index, view) for index, item in enumerate(items) if item.get("ok") for view in _windows(item, self.window)]
         made = [None] * len(views)
-        limit = max(int(budget), 1)
-        if getattr(self, "_model", None) is None:
-            self._model = load_model()
+        self.load()
 
-        def run(group: list[int]) -> None:
-            nonlocal limit
-            try:
-                produced = _forward_ready([views[position][1] for position in group], self._model)
-            except Exception as exc:
-                oom = isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
-                if oom:
-                    torch.cuda.empty_cache()
-                if oom and len(group) > 1:
-                    limit = max(1, limit // 2)
-                    mid = len(group) // 2
-                    run(group[:mid])
-                    run(group[mid:])
-                    return
-                message = str(exc).splitlines()[-1]
-                for position in group:
-                    results[views[position][0]] = (False, 0.0, message)
-                return
+        def forward(group: list[int]) -> None:
+            produced = _forward_ready([views[position][1] for position in group], self.model)
             for position, depth in zip(group, produced):
                 made[position] = depth
 
         started = time.perf_counter()
-        with compute_lock(self):
-            pending = list(range(len(views)))
-            while pending:
-                group = _slices(pending, [len(views[position][1]["images"]) for position in pending], limit)[0]
-                run(group)
-                pending = pending[len(group) :]
+        sizes = {position: len(view["images"]) for position, (_owner, view) in enumerate(views)}
+        with self.lock:
+            errors, limit = run_grouped(list(range(len(views))), sizes, budget, forward)
+        for position, message in errors.items():
+            results[views[position][0]] = Result(False, 0.0, message)
         frames = sum(len(item["images"]) for item in items if item.get("ok"))
         share = (time.perf_counter() - started) / max(frames, 1)
         saves = []
@@ -119,8 +101,8 @@ class Depth(Step):
                 depth[keep:] * (scale if scale is not None else borrowed if borrowed is not None else camera)
                 for (depth, scale, camera), keep in mine
             ]
-            results[index] = (True, share * len(item["images"]), "")
-            saves.append({"kind": "depth", "path": item["dst"], "data": np.concatenate(parts).astype(np.float32)})
+            results[index] = Result(True, share * len(item["images"]))
+            saves.append({"stage": self.name, "dst": item["dst"], "depth": np.concatenate(parts).astype(np.float32)})
         return results, saves, limit
 
 
@@ -151,28 +133,11 @@ def _windows(item: dict, window: int) -> list[dict]:
     return views
 
 
-def _slices(indexes: list[int], sizes: list[int], limit: int) -> list[list[int]]:
-    """Groups that fit in the frame budget. One episode longer than the budget stays whole."""
-    groups: list[list[int]] = []
-    current: list[int] = []
-    total = 0
-    for index, size in zip(indexes, sizes):
-        if current and total + size > limit:
-            groups.append(current)
-            current = []
-            total = 0
-        current.append(index)
-        total += size
-    if current:
-        groups.append(current)
-    return groups
-
-
 def _cameras(episode: Path, height: int, width: int, start: int, frames: int):
     with h5py.File(episode, "r") as handle:
         c2w = np.asarray(handle["transforms/camera"][start : start + frames], dtype=np.float64)
         intrinsic = np.asarray(handle["camera/intrinsic"], dtype=np.float64)
-    source_h, source_w = _source_size(episode.with_suffix(".mp4"))
+    source_h, source_w = frame_size(episode.with_suffix(".mp4"))
     intrinsic = intrinsic.copy()
     intrinsic[0] *= width / source_w
     intrinsic[1] *= height / source_h
@@ -182,13 +147,12 @@ def _cameras(episode: Path, height: int, width: int, start: int, frames: int):
 
 def load_model():
     """DA3-GIANT kept on a depth actor. Serial runs load and drop it per episode."""
-    if str(_SRC) not in sys.path:
-        sys.path.insert(0, str(_SRC))
-    _stub_evo()
-    from safetensors.torch import load_file
-
+    if not (_WEIGHTS / "model.safetensors").is_file():
+        raise FileNotFoundError(_WEIGHTS)
+    thirdparty.use_da3()
     from depth_anything_3.cfg import create_object, load_config
     from depth_anything_3.registry import MODEL_REGISTRY
+    from safetensors.torch import load_file
 
     model = create_object(load_config(MODEL_REGISTRY["da3-giant"])).cuda().eval()
     state = {key.removeprefix("model."): value for key, value in load_file(str(_WEIGHTS / "model.safetensors")).items()}
@@ -212,7 +176,7 @@ def _hand_points(episode: Path, start: int, count: int) -> np.ndarray:
         intrinsic = np.asarray(handle["camera/intrinsic"], dtype=np.float64)
         names = [name for name in transforms if name.startswith(("left", "right")) and any(part in name for part in _HAND_PARTS)]
         joints = np.stack([np.asarray(transforms[name][start : start + count, :3, 3], dtype=np.float64) for name in names], axis=1)
-    source_h, source_w = _source_size(episode.with_suffix(".mp4"))
+    source_h, source_w = frame_size(episode.with_suffix(".mp4"))
     height, width = int(source_h * SCALE), int(source_w * SCALE)
     rows = []
     for frame, camera in enumerate(c2w):
@@ -235,24 +199,16 @@ def _hand_scale(depth: np.ndarray, hand: np.ndarray) -> float | None:
     ratio = hand[:, 3] / np.maximum(depth[frame, row, col], 1e-6)
     middle = np.median(ratio)
     # Joints hidden behind an object read the occluder, so keep the ones near the consensus.
-    return float(np.median(ratio[np.abs(ratio / middle - 1) < 0.2]))
-
-
-def _source_size(video: Path) -> tuple[float, float]:
-    capture = cv2.VideoCapture(str(video))
-    height = float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)
-    width = float(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
-    capture.release()
-    if height <= 0 or width <= 0:
-        raise FileNotFoundError(video)
-    return height, width
+    near = ratio[np.abs(ratio / middle - 1) < 0.2]
+    # A split consensus can leave none near the median; NaN would spread to the whole piece.
+    if len(near) == 0 or not np.isfinite(middle):
+        return None
+    return float(np.median(near))
 
 
 def prepare_view(episode: Path, frames: np.ndarray, start: int = 0) -> dict:
     """CPU side of DA3: resize and cameras for frames that begin at `start`. The GPU actor only forwards."""
-    if str(_SRC) not in sys.path:
-        sys.path.insert(0, str(_SRC))
-    _stub_evo()
+    thirdparty.use_da3()
     from depth_anything_3.utils.io.input_processor import InputProcessor
 
     extrinsics, intrinsics = _cameras(Path(episode), frames.shape[1], frames.shape[2], start, len(frames))
@@ -269,21 +225,13 @@ def prepare_view(episode: Path, frames: np.ndarray, start: int = 0) -> dict:
     }
 
 
-def _store_depth(path: Path, depth: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, depth=np.asarray(depth, dtype=np.float32))
-
-
 def _forward_ready(items, model) -> list[tuple[np.ndarray, float | None, float]]:
     """One DA3 forward per group of windows with the same view count and size.
 
     Each window comes back as (depth at the stored size, hand scale or None, camera-path scale).
     """
-    if str(_SRC) not in sys.path:
-        sys.path.insert(0, str(_SRC))
-    _stub_evo()
+    thirdparty.use_da3()
     import torch
-
     from depth_anything_3.utils.geometry import affine_inverse
     from depth_anything_3.utils.io.output_processor import OutputProcessor
 
@@ -322,21 +270,6 @@ def _slice_output(raw, index: int, batch: int):
         else:
             data[key] = value
     return data
-
-
-def _stub_evo() -> None:
-    """DA3 imports evo while building the unused Gaussian head."""
-    import types
-
-    if "evo.core.trajectory" in sys.modules:
-        return
-    evo = types.ModuleType("evo")
-    core = types.ModuleType("evo.core")
-    trajectory = types.ModuleType("evo.core.trajectory")
-    trajectory.PosePath3D = type("PosePath3D", (), {})
-    sys.modules["evo"] = evo
-    sys.modules["evo.core"] = core
-    sys.modules["evo.core.trajectory"] = trajectory
 
 
 def _metric_scale(predicted: np.ndarray, reference: np.ndarray) -> float:

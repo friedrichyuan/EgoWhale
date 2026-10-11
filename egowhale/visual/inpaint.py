@@ -1,14 +1,20 @@
-"""Remove the person with ProPainter. The weights stay on the inpaint actor."""
+"""Remove the person. STTN by default; ProPainter is kept as the slower, higher-quality choice.
+
+The weights stay on the inpaint actor. Only one model is loaded per process.
+"""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from egowhale.media import load_masks, read_rgb, write_rgb
-from egowhale.step import INPAINT, MASKS, ROOT, Step, compute_lock, piece_dir, pieces
-from egowhale.visual.paint import load_models, paint_clips, paste, prepare_crop
+from egowhale.media import load_masks
+from egowhale.paths import INPAINT, MASKS, THIRDPARTY
+from egowhale.step import Result, Step, failed_items, run_grouped
 
-_ROOT = ROOT / "thirdparty" / "propainter"
+MODELS = ("sttn", "propainter")
+DEFAULT_MODEL = "sttn"
+LABELS = {"sttn": "STTN", "propainter": "ProPainter"}
 
 
 class Inpaint(Step):
@@ -16,101 +22,81 @@ class Inpaint(Step):
     needs = (MASKS,)
     makes = (INPAINT,)
     gpus = 1
+    per_piece = True
 
-    def load(self):
-        self._held = load_models(str(_ROOT / "weights"))
+    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+        super().__init__()
+        if model not in MODELS:
+            raise ValueError(f"inpaint model must be one of {MODELS}, not {model}")
+        self.model = model
+        self.held = None
+        self._paint = None
 
-    def run(self, src: Path, dst: Path) -> None:
+    def load(self) -> None:
+        if self.held is not None:
+            return
+        if self.model == "sttn":
+            from egowhale.visual import sttn
+
+            self.held, self._paint = sttn.load_model(), sttn.paint_clips
+        else:
+            from egowhale.visual import paint
+
+            self.held, self._paint = paint.load_models(str(THIRDPARTY / "propainter" / "weights")), paint.paint_clips
+
+    def release(self) -> None:
+        self.held = None
+
+    def prepare(self, src: Path, where: Path, start: int, stop: int) -> dict:
+        """CPU side of one piece, decoded a chunk at a time. ProPainter paints the mask box; STTN the whole frame."""
         video = Path(src).with_suffix(".mp4")
-        if getattr(self, "_held", None) is None:
-            self.load()
-        spans = pieces(dst)
-        for index, (start, stop) in enumerate(spans):
-            where = piece_dir(dst, index, len(spans))
-            if (where / INPAINT).is_file():
-                continue
-            frames, fps = read_rgb(video, start, stop)
-            masks = load_masks(where / MASKS)
-            if len(frames) != len(masks):
-                raise ValueError(f"{len(frames)} frames vs {len(masks)} masks")
-            clip = prepare_crop(frames, masks)
-            painted = paint_clips(self._held, [clip])[0]
-            write_rgb(where / INPAINT, paste(clip["background"], painted, clip["box"]), fps)
+        masks = load_masks(Path(where) / MASKS)
+        if self.model == "sttn":
+            from egowhale.visual.sttn import prepare_frames
 
-    def consume(self, payload: dict, budget: int) -> dict:
-        """Paint a dataloader batch. Same size and length share one forward. OOM halves the budget."""
-        import time
+            clip = prepare_frames(video, start, stop, masks)
+        else:
+            from egowhale.visual.paint import prepare_crop
 
+            clip = prepare_crop(video, start, stop, masks)
+        clip.update(dst=str(Path(where) / INPAINT), source=str(video), span=(start, stop))
+        return clip
+
+    def run_piece(self, src: Path, dst: Path, index: int) -> None:
+        clip = self.prepare(src, *self.piece(dst, index))
+        self.load()
+        self.store(self._save(clip, self._paint(self.held, [clip])[0]))
+
+    def consume(self, payload: dict, budget: int | None = None) -> dict:
+        """Paint a dataloader batch. ProPainter gives same-size, same-length pieces one forward. OOM halves the budget."""
         import ray
-        import torch
 
         items = payload["items"]
-        results = [None] * len(items)
+        results = failed_items(items)
         saves = []
-        todo = [index for index, item in enumerate(items) if item.get("ok")]
-        for index, item in enumerate(items):
-            if not item.get("ok"):
-                results[index] = (False, 0.0, item.get("error") or "feed failed")
-        limit = max(int(budget), 1)
-        if getattr(self, "_held", None) is None:
-            self.load()
+        self.load()
 
-        def run(indexes: list[int]) -> None:
-            nonlocal limit
-            if not indexes:
-                return
+        def forward(group: list[int]) -> None:
             started = time.perf_counter()
-            try:
-                painted = paint_clips(self._held, [items[index] for index in indexes])
-                for index, frames in zip(indexes, painted):
-                    saves.append({
-                        "kind": "video",
-                        "path": items[index]["dst"],
-                        "data": frames,
-                        "fps": items[index]["fps"],
-                        "background": items[index]["background"],
-                        "box": items[index]["box"],
-                    })
-            except Exception as exc:
-                oom = isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
-                if oom:
-                    torch.cuda.empty_cache()
-                if oom and len(indexes) > 1:
-                    limit = max(1, limit // 2)
-                    mid = max(1, len(indexes) // 2)
-                    run(indexes[:mid])
-                    run(indexes[mid:])
-                    return
-                message = str(exc).splitlines()[-1]
-                for index in indexes:
-                    results[index] = (False, 0.0, message)
-                return
-            share = (time.perf_counter() - started) / len(indexes)
-            for index in indexes:
-                results[index] = (True, share, "")
+            painted = self._paint(self.held, [items[index] for index in group])
+            share = (time.perf_counter() - started) / len(group)
+            for index, frames in zip(group, painted):
+                saves.append(self._save(items[index], frames))
+                results[index] = Result(True, share)
 
-        pending = list(todo)
+        todo = [index for index, result in enumerate(results) if result is None]
         sizes = {index: int(items[index]["frames"].shape[1]) for index in todo}
-        with compute_lock(self):
-            while pending:
-                group = _slices(pending, [sizes[index] for index in pending], limit)[0]
-                run(group)
-                pending = pending[len(group) :]
+        with self.lock:
+            errors, limit = run_grouped(todo, sizes, budget, forward)
+        for index, message in errors.items():
+            results[index] = Result(False, 0.0, message)
         return {"results": results, "budget": limit, "save_ref": ray.put(saves) if saves else None}
 
+    def _save(self, clip: dict, painted) -> dict:
+        # The writer decodes the source again for ProPainter's background, so only the painted box travels.
+        return {"stage": self.name, "dst": clip["dst"], "painted": painted, "box": clip["box"], "source": clip["source"], "span": clip["span"]}
 
-def _slices(indexes: list[int], sizes: list[int], limit: int) -> list[list[int]]:
-    """Groups that fit in the frame budget. One episode longer than the budget stays whole."""
-    groups: list[list[int]] = []
-    current: list[int] = []
-    total = 0
-    for index, size in zip(indexes, sizes):
-        if current and total + size > limit:
-            groups.append(current)
-            current = []
-            total = 0
-        current.append(index)
-        total += size
-    if current:
-        groups.append(current)
-    return groups
+    def store(self, save: dict) -> None:
+        from egowhale.visual.paint import write_painted
+
+        write_painted(Path(save["dst"]), save["source"], *save["span"], save["painted"], save["box"])

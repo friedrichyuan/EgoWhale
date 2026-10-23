@@ -14,7 +14,7 @@ from egowhale.robot import CAMERA, SCENE, hide, place_base, place_camera
 from egowhale.step import Step
 
 _GRIPPER_GEOMS = ("left_link7", "left_link8", "right_link17", "right_link18")
-ARM, GRIPPER_PART = 1, 2
+GRIPPER_PART = 2
 
 
 class Render(Step):
@@ -41,12 +41,19 @@ class Render(Step):
         else:
             rows = qpos[start:stop]
         rgb, robot_mask, gripper_mask, depth = _render(rows, base, intrinsic, height, width)
-        part = np.where(gripper_mask, GRIPPER_PART, np.where(robot_mask, ARM, 0)).astype(np.uint8)
-        rgb[~robot_mask] = 0
-        depth[~gripper_mask] = 0
+        part = _postprocess(rgb, robot_mask, gripper_mask, depth)
         path = where / RENDER
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, rgb=rgb, part=part, depth=depth)
+
+
+def _postprocess(rgb: np.ndarray, robot_mask: np.ndarray, gripper_mask: np.ndarray, depth: np.ndarray) -> np.ndarray:
+    """Keep the same pixels while avoiding full-frame int64 temporaries and boolean RGB indexing."""
+    part = robot_mask.astype(np.uint8)
+    np.copyto(part, 2, where=gripper_mask)
+    np.multiply(rgb, robot_mask[..., None], out=rgb)
+    depth[~gripper_mask] = 0
+    return part
 
 
 def load_render(path: Path):

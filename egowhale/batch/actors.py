@@ -36,12 +36,17 @@ def _action_steps() -> dict:
     return {name: STEPS[name]() for name in ACTION}
 
 
-class _Cpu:
+class _Identity:
+    def identity(self) -> dict:
+        return {"pid": os.getpid(), "actor_class": type(self).__name__}
+
+
+class _Cpu(_Identity):
     def ready(self) -> str:
         return "cpu"
 
 
-class _Gpu:
+class _Gpu(_Identity):
     def ready(self) -> str:
         return device()
 
@@ -149,7 +154,8 @@ class StoreActor(_Cpu):
 
     def commit(self, saves):
         for save in saves:
-            self.steps[save["stage"]].store(save)
+            stage = save["stage"]
+            self.steps[stage].store(save)
         return True
 
 
@@ -166,7 +172,8 @@ class ActionWriteActor(_Cpu):
         self.steps = _action_steps()
 
     def save(self, packed):
-        self.steps[packed["stage"]].save(Path(packed["dst"]), packed["out"])
+        stage = packed["stage"]
+        self.steps[stage].save(Path(packed["dst"]), packed["out"])
         return True
 
 
@@ -195,7 +202,7 @@ def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, 
     def make(names) -> None:
         for name in names:
             cls, options, configured = POOLS[name]
-            remote = ray.remote(**options(cpus))(cls)
+            remote = ray.remote(enable_task_events=False, **options(cpus))(cls)
             if name in share:
                 remote = remote.options(num_gpus=share[name])
             args = (inpaint_model, window) if configured else ()

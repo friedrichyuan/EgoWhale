@@ -26,9 +26,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-${CUDA_VISIBLE_DEVICES%%,*}}"
-# Ray 2.59 on gpu1 emits an empty timeline with interval 0; 1000 ms is verified.
-export RAY_PROFILING=1
-export RAY_task_events_report_interval_ms=1000
+# Sample physical resources by actor class; disable Ray function profiling.
+export RAY_PROFILING=0
 export EGOWHALE_BENCH_CONFIG="cfgs/bench8_sttn_balanced.yaml"
 
 bash scripts/bench.sh "$out" --episodes "$episodes" --limit "$limit"

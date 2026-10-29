@@ -1,64 +1,129 @@
-"""Resource attribution: shared GPU contexts must not double count, missing samples stay missing."""
-import time
+"""Hardware measurements use physical host counters, not Ray resource reservations."""
 from types import SimpleNamespace as Item
 
-from egowhale.batch.monitor import Resources
+import psutil
+import pytest
+
+from egowhale.batch.monitor import SystemMonitor
+
+
+class Writer:
+    def __init__(self):
+        self.values = {}
+
+    def add_scalar(self, tag, value, step):
+        self.values[tag] = (value, step)
 
 
 class Nvml:
     class NVMLError(Exception):
         pass
 
-    NVML_VALUE_NOT_AVAILABLE = -1
+    def nvmlDeviceGetMemoryInfo(self, device):
+        return Item(used=(device + 1) * 10 * 2**30)
 
-    def nvmlDeviceGetComputeRunningProcesses(self, handle):
-        return [Item(pid=10, usedGpuMemory=1024), Item(pid=20, usedGpuMemory=2048),
-                Item(pid=999, usedGpuMemory=4096)]
-
-    nvmlDeviceGetGraphicsRunningProcesses = nvmlDeviceGetComputeRunningProcesses
-
-    def nvmlDeviceGetUtilizationRates(self, handle):
-        return Item(gpu=80)
-
-    def nvmlDeviceGetMemoryInfo(self, handle):
-        return Item(used=10000)
-
-    def nvmlDeviceGetProcessUtilization(self, handle, stamp):
-        return [Item(pid=10, smUtil=70, timeStamp=int(time.time() * 1e6)),
-                Item(pid=20, smUtil=20, timeStamp=1)]  # stale sample
+    def nvmlDeviceGetUtilizationRates(self, device):
+        return Item(gpu=(device + 1) * 30)
 
 
-def monitor():
-    value = Resources.__new__(Resources)
-    value.nvml = Nvml()
-    value.devices = [0]
-    value.stamps = {}
-    value.interval = 1
+def monitor(monkeypatch):
+    import time
+
+    value = SystemMonitor.__new__(SystemMonitor)
+    value.writer, value.origin, value.cpus = Writer(), time.perf_counter(), 8
+    value.nvml, value.devices = Nvml(), [0, 1]
+    monkeypatch.setattr(psutil, 'cpu_times_percent', lambda: Item(idle=40, iowait=10))
+    monkeypatch.setattr(psutil, 'virtual_memory', lambda: Item(total=100*2**30, available=30*2**30,
+                                                            shared=5*2**30, cached=10*2**30))
+    monkeypatch.setattr(psutil, 'swap_memory', lambda: Item(used=2**30, sout=2*2**30))
     return value
 
 
-def test_gpu_grouping_deduplicates_graphics_and_compute_and_excludes_other_jobs():
-    value = monitor()
-    memory, samples, resident, devices = value.gpu({10: (None, 'DepthActor'), 20: (None, 'DepthActor')})
-    assert memory['DepthActor'] == 3072
-    assert resident['DepthActor'] == 2
-    assert samples['DepthActor'] == [70]
-    assert devices['0']['gpu_util_pct'] == 80
+def test_cpu_cores_and_memory_use_available_memory(monkeypatch):
+    value = monitor(monkeypatch)
+    value.sample()
+    rows = value.writer.values
+    assert rows['system/cpu_used_cores'][0] == 4
+    assert rows['system/cpu_utilization_pct'][0] == 50
+    assert rows['system/cpu_iowait_pct'][0] == 10
+    assert rows['system/memory_used_gb'][0] == 70
+    assert rows['system/memory_used_pct'][0] == 70
+    assert rows['system/memory_available_gb'][0] == 30
+    assert all(tag.startswith('system/') for tag in rows)
 
 
-def test_gpu_missing_samples_do_not_become_zero_utilization():
-    value = monitor()
-    def unavailable(*args):
+def test_gpu_counters_are_separate_physical_devices(monkeypatch):
+    value = monitor(monkeypatch)
+    value.sample()
+    assert value.writer.values['system/gpu0/memory_used_gb'][0] == 10
+    assert value.writer.values['system/gpu1/memory_used_gb'][0] == 20
+    assert value.writer.values['system/gpu1/utilization_pct'][0] == 60
+
+
+def test_unavailable_gpu_samples_are_omitted_not_zeroed(monkeypatch):
+    value = monitor(monkeypatch)
+    def unavailable(device):
         raise Nvml.NVMLError()
-    value.nvml.nvmlDeviceGetProcessUtilization = unavailable
-    memory, samples, resident, devices = value.gpu({10: (None, 'DepthActor')})
-    assert memory['DepthActor'] == 1024
-    assert not samples['DepthActor']
-    assert resident['DepthActor'] == 1
+    value.nvml.nvmlDeviceGetMemoryInfo = unavailable
+    value.sample()
+    assert 'system/gpu0/memory_used_gb' not in value.writer.values
+    assert 'system/cpu_used_cores' in value.writer.values
 
 
-def test_cpu_only_monitor_needs_no_nvml():
-    value = monitor()
-    value.nvml = None
-    memory, samples, resident, devices = value.gpu({10: (None, 'FeedActor')})
-    assert not memory and not samples and not resident and not devices
+def test_nvml_initialization_failure_keeps_error_and_cpu_monitoring(monkeypatch):
+    import sys
+    import time
+
+    def unavailable():
+        raise RuntimeError("NVML unavailable")
+
+    monkeypatch.setitem(sys.modules, "pynvml", Item(nvmlInit=unavailable))
+    with pytest.warns(UserWarning, match="NVML unavailable"):
+        value = SystemMonitor(Writer(), time.perf_counter())
+    assert value.error == "NVML unavailable"
+    assert value.nvml is None
+    value.sample()
+    assert "system/cpu_used_cores" in value.writer.values
+
+
+def test_sampling_failure_keeps_error_and_continues(monkeypatch):
+    import threading
+
+    value = monitor(monkeypatch)
+    value.stop = threading.Event()
+    value.interval = 0
+    attempts = []
+
+    def sample():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("sample unavailable")
+        value.stop.set()
+
+    monkeypatch.setattr(value, "sample", sample)
+    with pytest.warns(UserWarning, match="sample unavailable"):
+        value.run()
+    assert value.error == "sample unavailable"
+    assert len(attempts) == 2
+
+
+def test_report_records_live_system_metrics_without_resource_files(tmp_path, monkeypatch):
+    import time
+
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    from egowhale.batch import report
+
+    original = report.SystemMonitor
+    monkeypatch.setattr(report, 'SystemMonitor', lambda writer, origin: original(writer, origin, interval=0.05))
+    recorded = report.Report(tmp_path, {})
+    try:
+        time.sleep(0.3)
+    finally:
+        recorded.close()
+    board = EventAccumulator(str(tmp_path / 'tb')).Reload()
+    assert 'system/cpu_used_cores' in board.Tags()['scalars']
+    assert 'system/memory_used_gb' in board.Tags()['scalars']
+    assert not any(tag.startswith(('resource/', 'device/')) for tag in board.Tags()['scalars'])
+    assert not list(tmp_path.glob('resources*'))
+    assert not (tmp_path / 'tb' / 'resources').exists()

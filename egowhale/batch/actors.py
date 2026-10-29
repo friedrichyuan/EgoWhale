@@ -36,17 +36,12 @@ def _action_steps() -> dict:
     return {name: STEPS[name]() for name in ACTION}
 
 
-class _Identity:
-    def identity(self) -> dict:
-        return {"pid": os.getpid(), "actor_class": type(self).__name__}
-
-
-class _Cpu(_Identity):
+class _Cpu:
     def ready(self) -> str:
         return "cpu"
 
 
-class _Gpu(_Identity):
+class _Gpu:
     def ready(self) -> str:
         return device()
 

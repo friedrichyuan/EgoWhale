@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -378,19 +377,4 @@ def serve(jobs: list[Job], cfg: dict, pools: dict[str, int], share: dict[str, fl
     journal.info(f"{len(jobs)} episodes, {len(split)} split into {sum(len(job.spans) for job in split)} pieces    out {out}")
     report = Report(out, {name: pools[POOL[name]] for name in STEPS})
     journal.info(f"tensorboard --logdir {report.board}")
-    monitor = None
-    if os.environ.get("EGOWHALE_RESOURCE_MONITOR") == "1":
-        try:
-            from egowhale.batch.monitor import Resources
-
-            identities = ray.get([actor.identity.remote() for slots in free.values() for _label, actor in slots])
-            monitor = Resources(out, identities, report.meter.wall0)
-            monitor.start()
-            journal.info(f"Actor resources: {out / 'resources.jsonl'}; TensorBoard resource/<ActorClass>")
-        except Exception as exc:
-            journal.warning(f"Actor resource monitor unavailable: {short_error(exc)}")
-    try:
-        Scheduler(jobs, cfg, free, report).run()
-    finally:
-        if monitor is not None:
-            monitor.close()
+    Scheduler(jobs, cfg, free, report).run()

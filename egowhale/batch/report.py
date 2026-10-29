@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from egowhale.batch.dag import STEPS, Job
-from egowhale.batch.resources import available_gb, total_gb
+from egowhale.batch.monitor import SystemMonitor
 from egowhale.step import short_error
 
 # (pool, display name, category, model or role)
@@ -91,7 +91,7 @@ class Meter:
     """TensorBoard scalars, at most one point per MIN_INTERVAL seconds, plus one at each finished episode.
 
     system/ok and system/failed count episodes; system/fps is cumulative frames over elapsed seconds and
-    system/fps_5m the same over the last five minutes; system/memory_used_gb is host RAM when written.
+    system/fps_5m the same over the last five minutes. SystemMonitor samples hardware separately every 2 s.
     node/<stage>/fps uses the pool's cumulative compute time, times its actor count, so it shows what the pool
     can do: two episodes on one pool of N actors show N times the per-actor rate.
     The step is wall-clock seconds since boot.
@@ -144,9 +144,6 @@ class Meter:
             df = self._window[-1][1] - self._window[0][1]
             if dt >= 1:
                 writer.add_scalar("system/fps_5m", df / dt, step)
-        available = available_gb()
-        if available is not None:
-            writer.add_scalar("system/memory_used_gb", total_gb() - available, step)
         for name, node in self.nodes.items():
             if name in self.REPORTED and node["seconds"] >= 0.05:
                 writer.add_scalar(f"node/{name}/fps", node["frames"] / node["seconds"] * self.actors[name], step)
@@ -160,8 +157,10 @@ class Report:
 
         self.log = out / "batch.jsonl"
         self.board = out / "tb"
-        self.writer = SummaryWriter(log_dir=str(self.board))
+        self.writer = SummaryWriter(log_dir=str(self.board), flush_secs=5)
         self.meter = Meter(actors)
+        self.system = SystemMonitor(self.writer, self.meter.wall0)
+        self.system.start()
 
     def note(self, stage: str, frames: int, seconds: float) -> None:
         self.meter.note(stage, frames, seconds)
@@ -190,6 +189,7 @@ class Report:
             handle.write(json.dumps(row) + "\n")
 
     def close(self) -> None:
+        self.system.close()
         self.meter.write(self.writer, force=True)
         self.writer.flush()
         self.writer.close()

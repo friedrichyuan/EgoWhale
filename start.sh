@@ -26,8 +26,10 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-${CUDA_VISIBLE_DEVICES%%,*}}"
-# Sample physical resources by actor class; disable Ray function profiling.
+
 export RAY_PROFILING=0
+# Large NumPy frame arrays otherwise trigger costly THP compaction on this host.
+export NUMPY_MADVISE_HUGEPAGE="${NUMPY_MADVISE_HUGEPAGE:-0}"
 export EGOWHALE_BENCH_CONFIG="cfgs/bench8_sttn_balanced.yaml"
 
 bash scripts/bench.sh "$out" --episodes "$episodes" --limit "$limit"

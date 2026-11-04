@@ -72,6 +72,7 @@ def plan_memory(cfg: dict, pools: dict[str, int], height: int, width: int) -> li
     """Worst-case host memory in GiB by holder, for full-size pieces of a height x width source.
 
     Bytes per frame: a decoded frame, and the half-size frames inpaint, depth, and render work at.
+    With unbounded writes (write_slots_per_lane=0), visual results retain the legacy estimate, not a bound.
     """
     frame = height * width * 3
     half = (height // 2) * (width // 2)
@@ -95,7 +96,14 @@ def plan_memory(cfg: dict, pools: dict[str, int], height: int, width: int) -> li
         rows.append((f"{stage} queues", lanes[stage] * (queue * held[stage] + decoding) / 2**30))
     # Results waiting for the writer: masks are bool at full size, the painted frames, depth float32 at half.
     saved = {"segment": height * width, "inpaint": half * 3, "depth": half * 4}
-    rows.append(("visual results", sum(lanes[stage] * INFLIGHT * piece * saved[stage] for stage in VISUAL) / 2**30))
+    slots = cfg["io"]["write_slots_per_lane"]
+    result_frames = dict.fromkeys(VISUAL, piece)
+    if slots:
+        # Depth may group several short pieces. take() stops after reaching its budget, not before.
+        budget = cfg["nodes"]["depth"]["frames_per_forward"]
+        result_frames["depth"] = min(queue, max(piece, budget + piece - 1))
+    label = "visual results" if slots else "visual results (estimate; unbounded writes)"
+    rows.append((label, sum(lanes[stage] * (slots or INFLIGHT) * result_frames[stage] * saved[stage] for stage in VISUAL) / 2**30))
     # Render holds rgb, part, gripper mask, and depth at half size.
     rows.append(("render", pools["render"] * piece * half * (3 + 1 + 1 + 4) / 2**30))
     # Composite holds a piece of background, render, scene depth, robot depth, masks at full and half size, and the output.

@@ -53,6 +53,8 @@ DEFAULTS = {
         "queue_per_lane": 4,
         # Frames one visual GPU actor may hold across those pieces. One piece always fits.
         "queue_frames": 1200,
+        # Output batches reserved at GPU submission until their writer finishes; 0 keeps writes unbounded.
+        "write_slots_per_lane": 0,
         # CPUs each actor reserves for its whole life. Ray queues actors silently when they do not fit.
         "cpus": {"cpu": 1, "render": 1, "feed": 2, "write": 1, "action_read": 1, "action_write": 1},
     },
@@ -77,6 +79,9 @@ def load(path: Path | str, **overrides) -> dict:
             config[key] = value
     if not config["episodes"]:
         raise ConfigError(f"{path}: no episodes")
+    slots = config["io"]["write_slots_per_lane"]
+    if type(slots) is not int or slots < 0:
+        raise ConfigError(f"{path}: io.write_slots_per_lane must be a nonnegative integer")
     from egowhale.visual.inpaint import MODELS
 
     if config["nodes"]["inpaint"]["model"] not in MODELS:

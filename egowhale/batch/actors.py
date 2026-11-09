@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from egowhale.batch.dag import ACTION, STEPS, VISUAL
+from egowhale.robots.factory import make_step
 from egowhale.step import Result, execute, short_error
 
 
@@ -32,8 +33,8 @@ def _visual_steps(inpaint_model: str, window: int) -> dict:
     return {name: _visual_step(name, inpaint_model, window) for name in VISUAL}
 
 
-def _action_steps() -> dict:
-    return {name: STEPS[name]() for name in ACTION}
+def _action_steps(robot="arx") -> dict:
+    return {name: make_step(STEPS[name], robot) for name in ACTION}
 
 
 class _Cpu:
@@ -72,8 +73,8 @@ class DepthActor(_Visual):
 
 
 class ActionActor(_Gpu):
-    def __init__(self):
-        self.steps = _action_steps()
+    def __init__(self, robot="arx"):
+        self.steps = _action_steps(robot)
 
     def compute(self, stage, dst, data):
         import gc
@@ -99,8 +100,8 @@ class _Runner(_Cpu):
 
     stages: tuple[str, ...] = ()
 
-    def __init__(self):
-        self.steps = {name: STEPS[name]() for name in self.stages}
+    def __init__(self, robot="arx"):
+        self.steps = {name: make_step(STEPS[name], robot) for name in self.stages}
 
     def egl(self, card):
         egl(card)
@@ -112,10 +113,10 @@ class _Runner(_Cpu):
 class CpuActor(_Runner):
     stages = ("composite", "curate")
 
-    def __init__(self):
+    def __init__(self, robot="arx"):
         # Batch runs do not call the VLM.
         os.environ.pop("EGOWHALE_VLM_API_KEY", None)
-        super().__init__()
+        super().__init__(robot)
 
 
 class RenderActor(_Runner):
@@ -155,16 +156,16 @@ class StoreActor(_Cpu):
 
 
 class ActionReadActor(_Cpu):
-    def __init__(self):
-        self.steps = _action_steps()
+    def __init__(self, robot="arx"):
+        self.steps = _action_steps(robot)
 
     def load(self, stage, src, dst):
         return self.steps[stage].read(Path(src), Path(dst))
 
 
 class ActionWriteActor(_Cpu):
-    def __init__(self):
-        self.steps = _action_steps()
+    def __init__(self, robot="arx"):
+        self.steps = _action_steps(robot)
 
     def save(self, packed):
         stage = packed["stage"]
@@ -188,7 +189,7 @@ POOLS = {
 }
 
 
-def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, int], window: int, inpaint_model: str):
+def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, int], window: int, inpaint_model: str, robot: str = "arx"):
     """Every pool's actors as (label, handle). `share` is the GPU fraction for pools that stack on one card."""
     import ray
 
@@ -200,7 +201,7 @@ def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, 
             remote = ray.remote(enable_task_events=False, **options(cpus))(cls)
             if name in share:
                 remote = remote.options(num_gpus=share[name])
-            args = (inpaint_model, window) if configured else ()
+            args = (inpaint_model, window) if configured else (robot,)
             made[name] = [(f"{name}{index}", remote.remote(*args)) for index in range(pools[name])]
 
     # Whole cards are placed before fractional ones so a shared card cannot take a slot a whole actor needs.

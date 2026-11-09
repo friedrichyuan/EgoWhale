@@ -198,9 +198,10 @@ class Report:
 def _compare(job: Job, writer) -> None:
     """Up to COMPARE_FRAMES frames of the inpainted scene beside the composite. Only those frames are decoded."""
     from egowhale.media import read_frames, video_shape
-    from egowhale.paths import COMPOSITE, INPAINT, PREFIX
+    from egowhale.paths import COMPOSITE, INPAINT
+    from egowhale.robots.motion import prefix_length
 
-    prefix = len(np.load(job.dst / PREFIX)["qpos"])
+    prefix = prefix_length(job.dst)
     count = min(job.frames, video_shape(job.dst / COMPOSITE)[0] - max(prefix - 1, 0))
     if count <= 0:
         return

@@ -389,7 +389,7 @@ def serve(jobs: list[Job], cfg: dict, pools: dict[str, int], share: dict[str, fl
     preflight(cfg, pools, share, height, width)
     journal = logger()
     model = cfg["nodes"]["inpaint"]["model"]
-    free = make_actors(pools, share, cfg["io"]["cpus"], cfg["nodes"]["depth"]["window"], model)
+    free = make_actors(pools, share, cfg["io"]["cpus"], cfg["nodes"]["depth"]["window"], model, cfg.get("robot", "arx"))
     boot(free, journal, pools, {"inpaint": LABELS[model]})
     # Render and curate draw with EGL on the action cards, which cuRobo leaves mostly idle.
     cards = sorted({device.split(":")[-1] for device in ray.get([actor.ready.remote() for _label, actor in free["action"]])})

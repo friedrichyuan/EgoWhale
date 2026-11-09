@@ -20,9 +20,11 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="run only the first N episodes")
     parser.add_argument("--episodes", nargs="+", help="replace the config's episodes: .txt lists, HDF5 files, or dataset directories")
     parser.add_argument("--out", help="replace the config's output root; results go to <out>/<name>/")
+    parser.add_argument("--robot", choices=("arx", "piper", "dual_piper"))
+    parser.add_argument("--no-approach", action="store_const", const=False, default=None, dest="approach", help="do not generate an approach prefix")
     args = parser.parse_args()
     try:
-        cfg = configs.load(args.config, name=args.name, limit=args.limit, episodes=args.episodes, out=args.out)
+        cfg = configs.load(args.config, name=args.name, limit=args.limit, episodes=args.episodes, out=args.out, robot=args.robot, approach=args.approach)
         sources = configs.episodes(cfg)
         if not sources:
             raise ConfigError("no episodes")
@@ -31,7 +33,7 @@ def main() -> None:
         import yaml
 
         (out / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
-        jobs = [Job(src, out / src.parent.name / src.stem, cfg["piece_frames"]) for src in sources]
+        jobs = [Job(src, out / src.parent.name / src.stem, cfg["piece_frames"], approach=cfg["approach"]) for src in sources]
         pools, share = pools_from(cfg)
         watch = watched(len(jobs))
         for index, job in enumerate(jobs):

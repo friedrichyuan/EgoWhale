@@ -8,8 +8,10 @@ from pathlib import Path
 import numpy as np
 
 from egowhale.media import frame_size, video_shape
-from egowhale.paths import BASE, COMPOSITE, GRIPPER, IK, PREFIX, QUALITY
+from egowhale.paths import BASE, COMPOSITE, GRIPPER, IK, QUALITY
 from egowhale.quality import actions, checks, vlm
+from egowhale.robots import load_robot
+from egowhale.robots.motion import prefix_length, read_bases, read_motion
 from egowhale.step import Step
 
 # An episode whose dropped share of frames is above this is not kept, and is not sent to the VLM.
@@ -18,8 +20,12 @@ DROP_RATIO = 0.60
 
 class Curate(Step):
     name = "curate"
-    needs = (GRIPPER, IK, BASE, COMPOSITE, PREFIX)
+    needs = (GRIPPER, IK, BASE, COMPOSITE)
     makes = (QUALITY,)
+
+    def __init__(self, robot="arx"):
+        super().__init__()
+        self.robot = load_robot(robot)
 
     def run(self, src: Path, dst: Path) -> None:
         dst = Path(dst)
@@ -30,9 +36,8 @@ class Curate(Step):
             valid = np.asarray(data["valid"], dtype=bool)
             fps = float(data["fps"])
             intrinsic = np.asarray(data["intrinsic"], dtype=np.float64).copy()
-        with np.load(dst / IK) as data:
-            qpos = np.asarray(data["qpos"], dtype=np.float64)
-        base = np.asarray(json.loads((dst / BASE).read_text())["matrix"], dtype=np.float64)
+        qpos = self.robot.qpos(read_motion(dst / IK)).astype(np.float64)
+        base = read_bases(dst / BASE)
         frames = min(len(position), len(qpos))
         position, rotation, width, valid, qpos = (
             position[:frames],
@@ -44,7 +49,7 @@ class Curate(Step):
         _count, video_h, video_w, _video_fps = video_shape(dst / COMPOSITE)
         scale = video_h / frame_size(Path(src).with_suffix(".mp4"))[0]
         intrinsic[:2] *= scale
-        signals = checks.frame_checks(qpos, base, intrinsic, position, valid, video_h, video_w)
+        signals = checks.frame_checks(qpos, base, intrinsic, position, valid, video_h, video_w, self.robot)
         l1 = checks.erode(checks.passed(signals), fps)
         state, action = actions.trajectory(position, rotation, width)
         outlier = actions.outliers(action, l1)
@@ -54,7 +59,7 @@ class Curate(Step):
         invalid_ratio = float((~kept).mean())
         keep = invalid_ratio <= DROP_RATIO
         description = vlm.description(Path(src))
-        approach = len(np.load(dst / PREFIX)["qpos"]) - 1
+        approach = prefix_length(dst) - 1
         audit = vlm.audit(dst / COMPOSITE, approach, frames, fps, description) if keep else {"status": "skipped", "reason": "dropped before audit"}
         if audit.get("is_consistent") is False:
             keep = False

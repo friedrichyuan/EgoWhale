@@ -9,7 +9,7 @@ from __future__ import annotations
 import mujoco
 import numpy as np
 
-from egowhale.robot import CAMERA, SCENE, TCP, hide, place_base, place_camera
+from egowhale.robots import load_robot
 
 # Mean distance from the IK tool points to the tracked grippers, in meters.
 IK_LIMIT = 0.05
@@ -19,52 +19,28 @@ COVERAGE_LIMIT = 0.70
 MIN_RUN_SECONDS = 0.3
 
 
-def _load_model():
-    """Visual meshes stay hidden from collision. Convex copies are what contacts use."""
-    spec = mujoco.MjSpec.from_file(str(SCENE))
-    for body in spec.bodies:
-        if body.name != "base_link" and not body.name.startswith(("left_link", "right_link")):
-            continue
-        for geom in list(body.geoms):
-            if geom.type != mujoco.mjtGeom.mjGEOM_MESH:
-                continue
-            body.add_geom(
-                name=f"{geom.name}_hit",
-                type=mujoco.mjtGeom.mjGEOM_MESH,
-                meshname=geom.meshname,
-                pos=geom.pos,
-                quat=geom.quat,
-                contype=1,
-                conaffinity=1,
-                group=3,
-                rgba=[0.0, 0.0, 0.0, 0.0],
-            )
-    return spec.compile()
-
-
-_SCENES: dict[tuple[int, int], tuple] = {}
-
-
-def _scene(height: int, width: int):
+def _scene(height: int, width: int, robot):
     """One model and GL context per image size, kept for the life of the process."""
-    if (height, width) not in _SCENES:
-        model = _load_model()
-        hide(model)
+    scenes = robot.__dict__.setdefault("_quality_scenes", {})
+    if (height, width) not in scenes:
+        model = robot.quality_model()
+        robot.hide(model)
         model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), width)
         model.vis.global_.offheight = max(int(model.vis.global_.offheight), height)
         renderer = mujoco.Renderer(model, height=height, width=width)
-        _SCENES[(height, width)] = (model, mujoco.MjData(model), renderer)
-    return _SCENES[(height, width)]
+        scenes[(height, width)] = (model, mujoco.MjData(model), renderer)
+    return scenes[(height, width)]
 
 
-def frame_checks(qpos, base, intrinsic, position, hand_valid, height, width) -> dict[str, np.ndarray]:
+def frame_checks(qpos, base, intrinsic, position, hand_valid, height, width, robot=None) -> dict[str, np.ndarray]:
     """Per-frame signals for the arm at `qpos`, seen from the video camera at height x width."""
-    model, data, renderer = _scene(height, width)
-    place_base(model, base)
-    place_camera(model, intrinsic, height)
-    bodies = _robot_bodies(model)
+    robot = load_robot() if robot is None else robot
+    model, data, renderer = _scene(height, width, robot)
+    robot.place_bases(model, base)
+    robot.place_camera(model, intrinsic, height)
+    bodies = _robot_bodies(model, robot)
     parent = np.asarray(model.body_parentid)
-    sites = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) for name in TCP]
+    sites = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) for name in robot.tcp_sites]
     count = len(qpos)
     area = float(height * width)
     ik_error = np.full(count, np.nan)
@@ -85,7 +61,7 @@ def frame_checks(qpos, base, intrinsic, position, hand_valid, height, width) -> 
         self_collision[index] = same > 0
         cross_arm[index] = cross > 1
         renderer.enable_segmentation_rendering()
-        renderer.update_scene(data, camera=CAMERA)
+        renderer.update_scene(data, camera=robot.camera)
         pixels = int(np.count_nonzero(renderer.render()[:, :, 0] >= 0))
         renderer.disable_segmentation_rendering()
         visible[index] = pixels > 0
@@ -132,12 +108,12 @@ def erode(valid: np.ndarray, fps: float) -> np.ndarray:
     return out
 
 
-def _robot_bodies(model) -> dict[int, str]:
+def _robot_bodies(model, robot) -> dict[int, str]:
     bodies = {}
     for body_id in range(model.nbody):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
-        if name == "base_link" or name.startswith(("left_link", "right_link")):
-            bodies[body_id] = name
+        if robot.body_side(name) is not None:
+            bodies[body_id] = robot.body_side(name)
     return bodies
 
 
@@ -166,9 +142,9 @@ def _contacts(model, data, bodies, parent):
         second = int(model.geom_bodyid[contact.geom2])
         if first not in bodies or second not in bodies or first == second or _near(parent, first, second):
             continue
-        first_left = bodies[first].startswith("left_")
-        second_left = bodies[second].startswith("left_")
-        if first_left != second_left and "base_link" not in (bodies[first], bodies[second]):
+        first_left = bodies[first] == "left"
+        second_left = bodies[second] == "left"
+        if first_left != second_left and "shared" not in (bodies[first], bodies[second]):
             cross += 1
         else:
             same += 1

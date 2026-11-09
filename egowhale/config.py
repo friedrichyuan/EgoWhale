@@ -20,6 +20,8 @@ class ConfigError(ValueError):
 
 DEFAULTS = {
     "name": "run",
+    "robot": "arx",
+    "approach": True,
     # A .txt list of HDF5 paths, an HDF5 file, or a dataset directory; or a list of those.
     "episodes": None,
     # Results go to <out>/<name>/. Relative paths are taken from the repository root.
@@ -77,6 +79,10 @@ def load(path: Path | str, **overrides) -> dict:
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
+    if type(config["approach"]) is not bool:
+        raise ConfigError("approach must be true or false")
+    if config["robot"] not in ("arx", "piper", "dual_piper"):
+        raise ConfigError("robot must be arx or piper")
     if not config["episodes"]:
         raise ConfigError(f"{path}: no episodes")
     slots = config["io"]["write_slots_per_lane"]

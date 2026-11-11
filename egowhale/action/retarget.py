@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from scipy.signal import savgol_coeffs
 
-from egowhale.media import FPS
+from egowhale.media import FPS, data_fps, valid_fps, video_shape
 from egowhale.paths import GRIPPER
 from egowhale.step import Step
 
@@ -37,6 +37,7 @@ class Retarget(Step):
         position, rotation, width, valid, intrinsic = _episode_gpu(raw)
         position, rotation, width = _smooth_gpu(position, rotation, width, valid)
         return {
+            "fps": data_fps(raw),
             "position": position.astype(np.float32),
             "rotation": rotation.astype(np.float32),
             "width": width.astype(np.float32),
@@ -66,7 +67,12 @@ def _window(length: int) -> int | None:
 def read_episode(path: Path) -> dict:
     with h5py.File(path, "r") as handle:
         transforms = handle["transforms"]
+        video = path.with_suffix(".mp4")
+        fps = video_shape(video)[3] if video.is_file() else valid_fps(handle.attrs.get("egowhale_fps", FPS))
+        if "egowhale_fps" in handle.attrs and not np.isclose(fps, valid_fps(handle.attrs["egowhale_fps"]), rtol=1e-5):
+            raise ValueError(f"HDF5/video FPS mismatch: {path}")
         return {
+            "fps": fps,
             "intrinsic": np.asarray(handle["camera/intrinsic"], dtype=np.float64),
             "camera": np.asarray(transforms["camera"], dtype=np.float64),
             "joints": {
@@ -87,7 +93,7 @@ def save_gripper(dst: Path, result: dict) -> None:
         width=result["width"],
         valid=result["valid"],
         intrinsic=result["intrinsic"],
-        fps=np.float32(FPS),
+        fps=np.float32(data_fps(result)),
     )
 
 

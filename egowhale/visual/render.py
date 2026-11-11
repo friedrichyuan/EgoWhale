@@ -7,7 +7,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from egowhale.media import SCALE, frame_size
+from egowhale.media import SCALE, data_fps, video_shape
 from egowhale.paths import BASE, GRIPPER, IK, PREFIX, RENDER
 from egowhale.robots import load_robot
 from egowhale.robots.motion import read_bases, read_motion
@@ -29,17 +29,25 @@ class Render(Step):
     def run_piece(self, src: Path, dst: Path, index: int) -> None:
         """Render one piece. The approach leads the first piece only."""
         dst = Path(dst)
-        source_h, source_w = frame_size(Path(src).with_suffix(".mp4"))
+        _, source_h, source_w, fps = video_shape(Path(src).with_suffix(".mp4"))
         height, width = int(source_h * SCALE), int(source_w * SCALE)
-        qpos = self.robot.qpos(read_motion(dst / IK))
+        motion = read_motion(dst / IK)
+        if not np.isclose(data_fps(motion), fps, rtol=1e-5):
+            raise ValueError("IK/video FPS mismatch; regenerate upstream outputs for this dataset")
+        qpos = self.robot.qpos(motion)
         with np.load(dst / GRIPPER) as data:
+            if not np.isclose(data_fps(data), fps, rtol=1e-5):
+                raise ValueError("gripper/video FPS mismatch")
             intrinsic = np.asarray(data["intrinsic"], dtype=np.float64)
         intrinsic = intrinsic.copy()
         intrinsic[:2] *= height / source_h
         base = read_bases(dst / BASE)
         where, start, stop = self.piece(dst, index)
         if index == 0 and (dst / PREFIX).is_file():
-            rows = np.concatenate((self.robot.qpos(read_motion(dst / PREFIX)), qpos[1:stop]), axis=0)
+            prefix = read_motion(dst / PREFIX)
+            if not np.isclose(data_fps(prefix), fps, rtol=1e-5):
+                raise ValueError("approach/video FPS mismatch")
+            rows = np.concatenate((self.robot.qpos(prefix), qpos[1:stop]), axis=0)
         else:
             rows = qpos[start:stop]
         rgb, robot_mask, gripper_mask, depth = _render(rows, base, intrinsic, height, width, self.robot)

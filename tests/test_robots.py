@@ -81,15 +81,18 @@ def test_piper_urdf_matches_mjcf_fk():
     np.testing.assert_array_equal(fingers["left_joint7"], -fingers["left_joint8"])
 
 
+@pytest.mark.parametrize("fps", [18.0, 30.0])
 @pytest.mark.parametrize("name", ["arx", "piper"])
-def test_node_io_and_group_dispatch_without_gpu(tmp_path, monkeypatch, name):
+def test_node_io_and_group_dispatch_without_gpu(tmp_path, monkeypatch, name, fps):
     calls = []
-    def solve(position, rotation, valid, group):
+    def solve(position, rotation, valid, group, fps):
+        assert fps == data["fps"]
         calls.append((group.name, position.copy()))
         return np.eye(4), np.repeat(group.home[None], len(position), axis=0), {"position": 0., "jerk": 0.}
     monkeypatch.setattr(base_ik, "_solve", solve)
     data = dict(position=np.zeros((8, 2, 3)), rotation=np.tile(np.eye(3), (8, 2, 1, 1)),
                 width=np.full((8, 2), .04), valid=np.ones((8, 2), dtype=bool))
+    data["fps"] = fps
     data["position"][:, 1] = 1.
     node = base_ik.BaseIK(name)
     result = node.compute(data)
@@ -100,7 +103,9 @@ def test_node_io_and_group_dispatch_without_gpu(tmp_path, monkeypatch, name):
         np.testing.assert_array_equal(received, data["position"][:, list(group.sides)])
     loaded = read_motion(tmp_path / "action/ik.npz")
     assert len(read_bases(tmp_path / "action/base.json")) == len(groups)
-    def trajectory(goal, group):
+    assert float(loaded["fps"]) == fps
+    def trajectory(goal, group, fps):
+        assert fps == data["fps"]
         count = 10 if group.sides[0] == 0 else 16
         return np.linspace(group.home, goal, count)
     monkeypatch.setattr(approach, "_trajopt", trajectory)
@@ -108,6 +113,7 @@ def test_node_io_and_group_dispatch_without_gpu(tmp_path, monkeypatch, name):
     other = approach.Approach(name)
     prefix = other.compute(other.read(None, tmp_path))
     other.save(tmp_path, prefix)
+    assert float(prefix["fps"]) == fps
     np.testing.assert_allclose(prefix["joint_positions"][-1], loaded["joint_positions"][0])
     assert len(prefix["joint_positions"]) == (10 if name == "arx" else 16)
 
@@ -115,7 +121,8 @@ def test_node_io_and_group_dispatch_without_gpu(tmp_path, monkeypatch, name):
 @pytest.mark.parametrize("name", ["arx", "piper"])
 @pytest.mark.parametrize("with_prefix", [True, False])
 @pytest.mark.parametrize("split", [True, False])
-def test_render_and_actor_boundaries(tmp_path, monkeypatch, name, with_prefix, split):
+@pytest.mark.parametrize("fps", [18.0, 30.0])
+def test_render_and_actor_boundaries(tmp_path, monkeypatch, name, with_prefix, split, fps):
     import json
 
     from egowhale.batch.actors import ActionActor, ActionReadActor, ActionWriteActor, CpuActor, RenderActor
@@ -126,13 +133,14 @@ def test_render_and_actor_boundaries(tmp_path, monkeypatch, name, with_prefix, s
     (tmp_path / "pieces.json").write_text(json.dumps({"frames": 4, "limit": 2 if split else 10, "pieces": spans}))
     motion = robot.pack([np.repeat(g.home[None], 4, axis=0) for g in robot.groups],
                         np.full((4, 2), .04), np.ones((4, 2), dtype=bool))
+    motion["fps"] = fps
     motion["joint_positions"][:, 0] += np.arange(4) * .01
     np.savez_compressed(tmp_path / "action/ik.npz", **motion)
     if with_prefix:
         np.savez_compressed(tmp_path / "action/prefix.npz", **motion)
-    np.savez_compressed(tmp_path / "action/gripper.npz", intrinsic=np.array([[50., 0., 8.], [0., 50., 8.], [0., 0., 1.]]))
+    np.savez_compressed(tmp_path / "action/gripper.npz", fps=fps, intrinsic=np.array([[50., 0., 8.], [0., 50., 8.], [0., 0., 1.]]))
     (tmp_path / "action/base.json").write_text(json.dumps({"bases": {g.name: np.eye(4).tolist() for g in robot.groups}}))
-    monkeypatch.setattr(render, "frame_size", lambda _: (16, 16))
+    monkeypatch.setattr(render, "video_shape", lambda _: (4, 16, 16, fps))
     seen = []
     seen_rows = []
     def raster(qpos, bases, intrinsic, h, w, selected):

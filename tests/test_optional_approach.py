@@ -37,7 +37,8 @@ def test_dag_approach_dependency(tmp_path, enabled):
 
 
 @pytest.mark.parametrize("with_prefix", [False, True])
-def test_composite_piece_alignment(tmp_path, monkeypatch, with_prefix):
+@pytest.mark.parametrize("fps", [18.0, 30.0])
+def test_composite_piece_alignment(tmp_path, monkeypatch, with_prefix, fps):
     from egowhale.pieces import piece_dir
     from egowhale.visual import composite
     spans = [(0, 2), (2, 4)]
@@ -54,13 +55,13 @@ def test_composite_piece_alignment(tmp_path, monkeypatch, with_prefix):
         n = 4 if with_prefix and index == 0 else 2
         rendered[where] = (np.zeros((n, 2, 2, 3), np.uint8), np.zeros((n, 2, 2), bool), np.zeros((n, 2, 2), bool), np.ones((n, 2, 2)))
         np.savez(where / composite.DEPTH, depth=np.ones((2, 2, 2)))
-    monkeypatch.setattr(composite, "read_rgb", lambda p: (backgrounds[p.parent.parent], 30))
+    monkeypatch.setattr(composite, "read_rgb", lambda p: (backgrounds[p.parent.parent], fps))
     monkeypatch.setattr(composite, "load_render", lambda p: rendered[p.parent.parent])
     monkeypatch.setattr(composite, "load_masks", lambda p: np.zeros((2, 2, 2), bool))
     outputs = []
     class Writer:
         def __init__(self, *args):
-            pass
+            assert args[1] == fps
         def write(self, array):
             outputs.append(array)
         def close(self):

@@ -10,12 +10,11 @@ import torch
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
 
-from egowhale.media import FPS
+from egowhale.media import FPS, data_fps, valid_fps
 from egowhale.paths import BASE, GRIPPER, IK
 from egowhale.robots import load_robot
 from egowhale.step import Step
 
-_DT = 1.0 / FPS
 _SEEDS = 2
 _STEPS = 120
 
@@ -47,19 +46,20 @@ class BaseIK(Step):
         for group in self.robot.groups:
             sides = list(group.sides)
             matrix, arm, terms = _solve(data["position"][:, sides], data["rotation"][:, sides],
-                                        data["valid"][:, sides], group)
+                                        data["valid"][:, sides], group, fps=data_fps(data))
             arms.append(arm)
             bases[group.name] = matrix
             losses[group.name] = terms
         motion = self.robot.pack(arms, data["width"], data["valid"])
         # Keep the existing console summary; per-group losses are saved separately.
         summary = {key: float(np.mean([v[key] for v in losses.values()])) for key in next(iter(losses.values()))}
-        return {**motion, "bases": bases, "losses": summary, "group_losses": losses}
+        return {**motion, "fps": data_fps(data), "bases": bases, "losses": summary, "group_losses": losses}
 
 
 def read_gripper(dst: Path) -> dict:
     with np.load(Path(dst) / GRIPPER) as data:
         return {
+            "fps": data_fps(data),
             "position": np.asarray(data["position"], dtype=np.float64),
             "rotation": np.asarray(data["rotation"], dtype=np.float64),
             "width": np.asarray(data["width"], dtype=np.float64),
@@ -72,10 +72,10 @@ def save_base(dst: Path, result: dict) -> None:
     base_path = dst / BASE
     base_path.parent.mkdir(parents=True, exist_ok=True)
     base_path.write_text(json.dumps({"bases": {n: m.tolist() for n, m in result["bases"].items()}, "losses": result["losses"], "group_losses": result["group_losses"]}, indent=2))
-    np.savez_compressed(dst / IK, joint_names=result["joint_names"], joint_positions=result["joint_positions"], fps=np.float32(FPS))
+    np.savez_compressed(dst / IK, joint_names=result["joint_names"], joint_positions=result["joint_positions"], fps=np.float32(data_fps(result)))
 
 
-def _solve(position, rotation, valid, group):
+def _solve(position, rotation, valid, group, fps=FPS):
     from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
     from curobo.kinematics import Kinematics, KinematicsCfg
 
@@ -96,7 +96,7 @@ def _solve(position, rotation, valid, group):
         )
     )
     offset, arm = _best_seed(ik, goal_p, goal_r, seed_r, seed_t, offsets, group)
-    offset, arm, losses = _refine(kin, goal_p, goal_r, valid, seed_r, seed_t, offset, arm, group)
+    offset, arm, losses = _refine(kin, goal_p, goal_r, valid, seed_r, seed_t, offset, arm, group, fps=fps)
     arm = _smooth_arm(arm)
     return _camera_matrix(seed_r, seed_t, offset), arm, losses
 
@@ -132,7 +132,7 @@ def _best_seed(ik, position, rotation, seed_r, seed_t, offsets, group):
     return offsets[choice], arm[choice]
 
 
-def _refine(kin, position, rotation, valid, seed_r, seed_t, offset, arm, group):
+def _refine(kin, position, rotation, valid, seed_r, seed_t, offset, arm, group, fps=FPS):
     pos, quat = _wxyz_pair(position, rotation)
     goal_p = torch.tensor(pos, device="cuda", dtype=torch.float32)
     goal_q = torch.tensor(quat, device="cuda", dtype=torch.float32)
@@ -146,7 +146,7 @@ def _refine(kin, position, rotation, valid, seed_r, seed_t, offset, arm, group):
     bounds = torch.tensor(group.bounds, device="cuda", dtype=torch.float32)
     for _step in range(_STEPS):
         opt.zero_grad(set_to_none=True)
-        total, _terms = _loss(kin, q, base, goal_p, goal_q, mask, seed_R, seed_t, group, (lower, upper))
+        total, _terms = _loss(kin, q, base, goal_p, goal_q, mask, seed_R, seed_t, group, (lower, upper), fps=fps)
         if not torch.isfinite(total):
             break
         total.backward()
@@ -156,12 +156,12 @@ def _refine(kin, position, rotation, valid, seed_r, seed_t, offset, arm, group):
             q.clamp_(lower, upper)
             base.clamp_(-bounds, bounds)
     with torch.no_grad():
-        _total, terms = _loss(kin, q, base, goal_p, goal_q, mask, seed_R, seed_t, group, (lower, upper))
+        _total, terms = _loss(kin, q, base, goal_p, goal_q, mask, seed_R, seed_t, group, (lower, upper), fps=fps)
     losses = {key: float(value.detach().cpu()) for key, value in terms.items()}
     return base.detach().cpu().numpy(), q.detach().cpu().numpy(), losses
 
 
-def _loss(kin, q, base, goal_p, goal_q, mask, seed_R, seed_t, group, limits):
+def _loss(kin, q, base, goal_p, goal_q, mask, seed_R, seed_t, group, limits, fps=FPS):
     pos, quat = _fk_camera(kin, q, base, seed_R, seed_t, group)
     pos_err = torch.linalg.norm(pos - goal_p, dim=-1)
     dot = (quat * goal_q).sum(dim=-1).abs().clamp(0.0, 1.0)
@@ -170,9 +170,9 @@ def _loss(kin, q, base, goal_p, goal_q, mask, seed_R, seed_t, group, limits):
     position = (pos_err * mask).sum() / scale
     orientation = (ori * mask).sum() / scale
     delta = q[1:] - q[:-1]
-    continuity = delta.square().mean()
-    velocity = (delta / _DT).square().mean()
-    jerk = (q[3:] - 3.0 * q[2:-1] + 3.0 * q[1:-2] - q[:-3]).square().mean()
+    continuity = delta.square().mean() if len(delta) else q.sum() * 0.0
+    velocity = (delta * valid_fps(fps)).square().mean() if len(delta) else q.sum() * 0.0
+    jerk = (q[3:] - 3.0 * q[2:-1] + 3.0 * q[1:-2] - q[:-3]).square().mean() if len(q) >= 4 else q.sum() * 0.0
     low, high = limits
     joint_limit = torch.relu(low - q).square().mean() + torch.relu(q - high).square().mean()
     total = 20.0 * position + 5.0 * orientation + 4.0 * continuity + 0.05 * velocity + 2.0 * jerk + 5.0 * joint_limit

@@ -1,12 +1,15 @@
-"""Serial batch benchmark of one node, with persistent models and explicit input roots."""
+"""Benchmark one node with persistent workers and explicit input roots."""
 from __future__ import annotations
 
 import argparse
 import gc
 import json
+import multiprocessing as mp
 import os
 import shutil
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing.util import Finalize
 from pathlib import Path
 
 from egowhale.config import episodes
@@ -18,28 +21,33 @@ def prepare(src, dst, inputs, step, piece_frames):
     """Link only prerequisites; writes always belong to the fresh benchmark directory."""
     from egowhale.__main__ import STEPS
 
+    roots = [] if inputs is None else ([inputs] if isinstance(inputs, Path) else list(inputs))
+    plans = [(root / "pieces.json") for root in roots if (root / "pieces.json").is_file()]
+    if plans and any(json.loads(p.read_text()) != json.loads(plans[0].read_text()) for p in plans[1:]):
+        raise ValueError(f"Incompatible piece plans: {plans}")
     dst.mkdir(parents=True, exist_ok=True)
-    if inputs is not None and (inputs / "pieces.json").is_file():
-        shutil.copyfile(inputs / "pieces.json", dst / "pieces.json")
+    if plans:
+        shutil.copyfile(plans[0], dst / "pieces.json")
     else:
         plan(src, dst, piece_frames)
     if step.needs:
-        if inputs is None:
+        if not roots:
             raise FileNotFoundError(f"{step.name} needs {step.needs}; provide --inputs-root")
-        # Carry forward known upstream artifacts, excluding this node's old outputs.
-        # This lets successive isolated benchmarks be chained without copying videos.
         names = set(step.needs)
         for cls in STEPS:
             names.update(cls.makes)
         for name in sorted(names - set(step.makes)):
             for target in located(dst, name):
-                source = inputs / target.relative_to(dst)
-                if source.is_file():
+                sources = { (root / target.relative_to(dst)).resolve()
+                            for root in roots if (root / target.relative_to(dst)).is_file() }
+                if len(sources) > 1:
+                    raise ValueError(f"Conflicting upstream artifact {target.relative_to(dst)}: {sources}")
+                if sources:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.symlink_to(source.resolve())
+                    target.symlink_to(sources.pop())
         absent = missing(dst, step.needs)
         if absent:
-            raise FileNotFoundError(f"Missing upstream files under {inputs}: {absent}")
+            raise FileNotFoundError(f"Missing upstream files under {roots}: {absent}")
 
 
 def processed_frames(step, dst, source_frames):
@@ -93,51 +101,157 @@ def summarize(rows, load_s, wall_s):
                 overall_fps=sum(r["frames"] for r in good)/wall_s if wall_s else None)
 
 
-def benchmark(step, sources, out, inputs_root=None, warmup=1, piece_frames=600):
+class _EpisodeRunner:
+    """Reuse one node and its models for the episodes handled by this process."""
+
+    def __init__(self, step, inputs_root, warmup, piece_frames):
+        self.step = step
+        self.inputs_root = inputs_root
+        self.warmup = warmup
+        self.piece_frames = piece_frames
+        self.loaded = False
+        self.successes = 0
+
+    def run(self, src, dst, key):
+        step = self.step
+        inputs = self.inputs_root
+        row = dict(episode=str(src), output=str(dst), stage=step.name, status="failed")
+        started = time.perf_counter()
+        load_s = 0.0
+        try:
+            if isinstance(inputs, list):
+                roots = [root / key for root in inputs]
+            else:
+                roots = inputs / key if inputs else None
+            prepare(src, dst, roots, step, self.piece_frames)
+            frames = pieces(dst)[-1][1]
+            if not self.loaded:
+                before = time.perf_counter()
+                step.load()
+                load_s = time.perf_counter() - before
+                self.loaded = True
+            row.update(measure(step, src, dst))
+            row["frames"], row["frame_basis"] = processed_frames(step, dst, frames)
+            row.update(status="ok", warmup=self.successes < self.warmup)
+            self.successes += 1
+            row["fps"] = row["frames"] / max(row["node_s"], 1e-12)
+        except Exception as exc:
+            row["error"] = f"{type(exc).__name__}: {exc}"
+        if callable(getattr(step, "compute", None)):
+            # cuRobo solver reference cycles must not accumulate between episodes.
+            gc.collect()
+        row["episode_wall_s"] = time.perf_counter() - started
+        return row, load_s
+
+
+def _jobs(sources, out):
     keys = [Path(src.parent.name) / src.stem for src in sources]
     if len(set(keys)) != len(keys):
         raise ValueError("Episode task/name collisions or duplicates in input list")
     out.mkdir(parents=True, exist_ok=False)
+    return [(src, out / key, key) for src, key in zip(sources, keys, strict=True)]
+
+
+def _record(results, out, started):
+    """Only the coordinator writes shared benchmark files."""
     rows = []
-    load_s = 0.
-    loaded = False
-    successes = 0
-    started = time.perf_counter()
-    try:
-        for src, key in zip(sources, keys):
-            row = dict(episode=str(src), output=str(out/key), stage=step.name, status="failed")
-            episode_start = time.perf_counter()
-            try:
-                prepare(src, out/key, inputs_root/key if inputs_root else None, step, piece_frames)
-                frames = pieces(out/key)[-1][1]
-                if not loaded:
-                    before = time.perf_counter()
-                    step.load()
-                    load_s += time.perf_counter()-before
-                    loaded = True
-                row.update(measure(step, src, out/key))
-                row["frames"], row["frame_basis"] = processed_frames(step, out/key, frames)
-                row.update(status="ok", warmup=successes<warmup)
-                successes += 1
-                row["fps"] = row["frames"] / max(row["node_s"], 1e-12)
-            except Exception as exc:
-                row["error"] = f"{type(exc).__name__}: {exc}"
-            if callable(getattr(step, "compute", None)):
-                # cuRobo solver reference cycles must not accumulate between episodes.
-                gc.collect()
-            row["episode_wall_s"] = time.perf_counter()-episode_start
-            rows.append(row)
-            with (out/"results.jsonl").open("a") as handle:
-                handle.write(json.dumps(row)+"\n")
-            summary = summarize(rows, load_s, time.perf_counter()-started)
-            (out/"summary.json").write_text(json.dumps(summary, indent=2))
-            print(json.dumps(row), flush=True)
-    finally:
-        step.release()
-    summary = summarize(rows, load_s, time.perf_counter()-started)
-    (out/"summary.json").write_text(json.dumps(summary, indent=2))
+    load_s = 0.0
+
+    def snapshot():
+        summary = summarize(rows, load_s, time.perf_counter() - started)
+        temp = out / ".summary.json.tmp"
+        temp.write_text(json.dumps(summary, indent=2))
+        temp.replace(out / "summary.json")
+        return summary
+
+    with (out / "results.jsonl").open("a") as handle:
+        try:
+            for row, loaded in results:
+                rows.append(row)
+                load_s += loaded
+                handle.write(json.dumps(row) + "\n")
+                handle.flush()
+                snapshot()
+                print(json.dumps(row), flush=True)
+        finally:
+            summary = snapshot()
     print(json.dumps(summary, indent=2), flush=True)
     return summary
+
+
+def benchmark(step, sources, out, inputs_root=None, warmup=1, piece_frames=600):
+    jobs = _jobs(sources, out)
+    runner = _EpisodeRunner(step, inputs_root, warmup, piece_frames)
+    def results():
+        try:
+            for job in jobs:
+                yield runner.run(*job)
+        finally:
+            step.release()
+
+    return _record(results(), out, time.perf_counter())
+
+
+def _bind_device(stage, device):
+    os.environ["CUDA_VISIBLE_DEVICES"] = device if device is not None else "-1"
+    if stage in ("render", "curate"):
+        os.environ["MUJOCO_GL"] = "egl"
+        os.environ["PYOPENGL_PLATFORM"] = "egl"
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = device
+
+
+def _make_step(args):
+    from egowhale.__main__ import STEPS
+    from egowhale.robots.factory import make_step
+    from egowhale.visual.depth import Depth
+    from egowhale.visual.inpaint import Inpaint
+
+    cls = next(s for s in STEPS if s.name == args.stage)
+    if cls is Inpaint:
+        return Inpaint(args.inpaint_model)
+    if cls is Depth:
+        return Depth(args.window)
+    return make_step(cls, args.robot)
+
+
+_worker_runner = None
+
+
+def _init_worker(slots, args, inputs):
+    global _worker_runner
+    _bind_device(args.stage, slots.get())
+    step = _make_step(args)
+    _worker_runner = _EpisodeRunner(step, inputs, args.warmup, args.piece_frames)
+    Finalize(None, step.release, exitpriority=10)
+
+
+def _worker_run(job):
+    row, load_s = _worker_runner.run(*job)
+    row.update(worker_pid=os.getpid(), gpu=os.environ["CUDA_VISIBLE_DEVICES"])
+    return row, load_s
+
+
+def _parallel_results(jobs, devices, args, inputs):
+    # CUDA and EGL must be initialized in clean processes after binding each worker's device.
+    ctx = mp.get_context("spawn")
+    slots = ctx.Queue()
+    try:
+        for device in devices:
+            slots.put(device)
+        with ProcessPoolExecutor(
+            max_workers=len(devices), mp_context=ctx,
+            initializer=_init_worker, initargs=(slots, args, inputs),
+        ) as pool:
+            futures = [pool.submit(_worker_run, job) for job in jobs]
+            try:
+                for future in as_completed(futures):
+                    yield future.result()
+            finally:
+                for future in futures:
+                    future.cancel()
+    finally:
+        slots.close()
+        slots.join_thread()
 
 
 def main():
@@ -145,43 +259,62 @@ def main():
     parser.add_argument("stage", choices=("retarget", "segment", "inpaint", "depth", "base_ik", "approach", "render", "composite", "curate"))
     parser.add_argument("--episodes", nargs="+", required=True, help="HDF5 files, directories, or text lists")
     parser.add_argument("--out", type=Path, required=True, help="fresh output root; episodes stored under task/name")
-    parser.add_argument("--inputs-root", type=Path, help="upstream results root with task/name layout")
+    parser.add_argument("--inputs-root", type=Path, nargs="+", help="one or more upstream roots with identical task/name and piece layout")
     parser.add_argument("--robot", choices=("arx", "piper", "dual_piper"), default="arx")
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--warmup", type=int, default=1, help="successful episodes excluded from after_warmup metrics")
+    parser.add_argument("--warmup", type=int, default=1, help="successful episodes per worker excluded from after_warmup metrics")
+    parser.add_argument("--workers", type=int, help="persistent processes; default one per visible GPU, or one for composite")
     parser.add_argument("--piece-frames", type=int, default=600)
     parser.add_argument("--inpaint-model", choices=("sttn", "propainter"), default="sttn")
     parser.add_argument("--window", type=int, default=1, help="depth views per window")
     args = parser.parse_args()
     if args.limit < 0 or args.warmup < 0 or args.piece_frames < 1 or args.window < 1:
         parser.error("invalid negative count or zero window/piece size")
+    if args.workers is not None and args.workers < 1:
+        parser.error("--workers must be positive")
     sources = episodes(dict(episodes=args.episodes, order="list", limit=args.limit))
     if not sources:
         parser.error("no episodes")
     out = args.out.expanduser().resolve()
     if out.exists():
         parser.error("--out must be new so prior outputs cannot be skipped or overwritten")
-    if args.stage != "composite":
-        device = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        if not device.isdigit():
-            parser.error("set CUDA_VISIBLE_DEVICES to one physical GPU index (for example 9)")
-        if args.stage in ("render", "curate"):
-            os.environ["MUJOCO_GL"] = "egl"
-            os.environ["PYOPENGL_PLATFORM"] = "egl"
-            os.environ["MUJOCO_EGL_DEVICE_ID"] = device
-    from egowhale.__main__ import STEPS
-    from egowhale.robots.factory import make_step
-    from egowhale.visual.depth import Depth
-    from egowhale.visual.inpaint import Inpaint
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if args.stage == "composite":
+        cards = [None]
+    else:
+        cards = [part.strip() for part in visible.split(",")]
+        if any(not card.isascii() or not card.isdecimal() for card in cards):
+            parser.error("set CUDA_VISIBLE_DEVICES to physical GPU indices (for example 6 or 2,6)")
+        cards = [str(int(card)) for card in cards]
+        if len(set(cards)) != len(cards):
+            parser.error("CUDA_VISIBLE_DEVICES must list distinct GPUs")
+    count = min(args.workers or len(cards), len(sources))
+    devices = [cards[index % len(cards)] for index in range(count)]
+    inputs = [p.expanduser().resolve() for p in args.inputs_root] if args.inputs_root else None
 
-    cls = next(s for s in STEPS if s.name == args.stage)
-    step = Inpaint(args.inpaint_model) if cls is Inpaint else Depth(args.window) if cls is Depth else make_step(cls, args.robot)
-    inputs = args.inputs_root.expanduser().resolve() if args.inputs_root else None
-    if step.needs and inputs is None:
-        parser.error(f"{args.stage} requires --inputs-root; upstream nodes are not run automatically")
-    summary = benchmark(step, sources, out, inputs, args.warmup, args.piece_frames)
-    (out/"run_config.json").write_text(json.dumps({**vars(args), "out": str(out),
-        "episodes_resolved": [str(p) for p in sources], "mode": "serial_persistent_node", "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "")}, default=str, indent=2))
+    if count == 1:
+        _bind_device(args.stage, devices[0])
+        step = _make_step(args)
+        if step.needs and inputs is None:
+            parser.error(f"{args.stage} requires --inputs-root; upstream nodes are not run automatically")
+        summary = benchmark(step, sources, out, inputs, args.warmup, args.piece_frames)
+    else:
+        # Check requirements before creating the pool. The parent never constructs or loads a model.
+        if inputs is None:
+            from egowhale.__main__ import STEPS
+
+            cls = next(s for s in STEPS if s.name == args.stage)
+            if cls.needs:
+                parser.error(f"{args.stage} requires --inputs-root; upstream nodes are not run automatically")
+        jobs = _jobs(sources, out)
+        started = time.perf_counter()
+        summary = _record(_parallel_results(jobs, devices, args, inputs), out, started)
+    config = {
+        **vars(args), "out": str(out), "episodes_resolved": [str(p) for p in sources],
+        "mode": "serial_persistent_node" if count == 1 else "parallel_persistent_nodes",
+        "cuda_visible_devices": visible, "workers": count, "worker_devices": devices,
+    }
+    (out / "run_config.json").write_text(json.dumps(config, default=str, indent=2))
     raise SystemExit(1 if summary["failed"] else 0)
 
 

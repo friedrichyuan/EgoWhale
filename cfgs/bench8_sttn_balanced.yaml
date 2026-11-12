@@ -1,18 +1,20 @@
 # Candidate 8-GPU layout for STTN. Validate peak per-process VRAM and throughput on a free host before a full run.
 # 2 segment cards x 3 actors, 2 STTN cards with one cuRobo actor each, 4 depth cards, 8 EGL render actors.
+robot: piper
 name: bench8_sttn_balanced
-episodes: datasets/egodex/test_episodes.txt
+episodes: datasets/egodex/test_fixed.txt
 out: outputs
-order: shuffle
-seed: 20261021
+order: list
+seed: 20261109
 piece_frames: 600
+approach: false
 
 nodes:
-  segment: {cards: 2, actors_per_card: 3}
+  segment: {cards: 2, actors_per_card: 4}
   inpaint: {cards: 2, model: sttn}
   depth: {cards: 4, window: 1, frames_per_forward: 96}
   action: {ride: inpaint, actors_per_card: 1, gpu_share: 0.1}
-  render: {actors: 8}
+  render: {actors: 4}
   cpu: {actors: 8}
 
 io:

@@ -128,7 +128,7 @@ class PiperRobot(Robot):
                 "cspace": {"joint_names": list(joints), "default_joint_position": home.tolist(),
                            "null_space_weight": [1.] * 6, "cspace_distance_weight": [1.] * 6,
                            "max_acceleration": 15., "max_jerk": 500.}}}}
-            result.append(SolveGroup(side, (side_index,), joints, tools, config, lower, upper, home, .626, BOUNDS.copy()))
+            result.append(SolveGroup(side, (side_index,), joints, tools, config, lower, upper, home, .626, BOUNDS.copy(), batch_key="piper"))
         return tuple(result)
 
     def gripper_positions(self, width, valid):

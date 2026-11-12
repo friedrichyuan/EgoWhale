@@ -76,6 +76,60 @@ class ActionActor(_Gpu):
     def __init__(self, robot="arx"):
         self.steps = _action_steps(robot)
 
+    def advance_ik(self, payload, batch_size, start=0, count=0):
+        """Transport adapter only: persistent IK state belongs to the node's stream."""
+        import ray
+        started = time.perf_counter()
+        if getattr(self, "ik_stream", None) is None:
+            self.ik_stream = self.steps["base_ik"].open_stream(batch_size)
+            self.ik_seconds = {}
+        selected = [] if payload is None else payload[start:start+count]
+        arrivals = [(item["dst"],item["data"]) for item in selected if item["ok"]]
+        rows = [dict(token=item["dst"],ok=False,error=item["error"],seconds=0.,save_ref=None)
+                for item in selected if not item["ok"]]
+        tokens = set(self.ik_stream.active) | {token for token,_ in arrivals}
+        try:
+            completed = self.ik_stream.advance(arrivals)
+        except Exception as exc:
+            completed = [dict(token=t,ok=False,error=short_error(exc)) for t in tokens]
+            self.ik_stream.close()
+            self.ik_stream = None
+        elapsed = time.perf_counter()-started
+        for token in tokens:
+            self.ik_seconds[token] = self.ik_seconds.get(token,0.) + elapsed/max(len(tokens),1)
+        for row in completed:
+            token = row["token"]
+            row["seconds"] = self.ik_seconds.pop(token,0.)
+            row["save_ref"] = (ray.put(dict(stage="base_ik",dst=token,out=row.pop("out"))) if row["ok"] else None)
+            rows.append(row)
+        return dict(rows=rows,live=list(self.ik_stream.active) if self.ik_stream else [])
+
+    def compute_many(self, stage, payload, batch_size):
+        import gc
+
+        import ray
+        import torch
+        started = time.perf_counter()
+        rows = [{"ok": False, "error": item.get("error", "read failed"), "seconds": 0., "save_ref": None} for item in payload]
+        good = [i for i, item in enumerate(payload) if item["ok"]]
+        try:
+            if good:
+                data = [payload[i]["data"] for i in good]
+                if stage == "base_ik":
+                    raise ValueError("streaming Base_IK must use advance_ik")
+                outputs = [self.steps[stage].compute(item) for item in data]
+                seconds = (time.perf_counter() - started) / len(good)
+                for i, out in zip(good, outputs, strict=True):
+                    packed = {"stage": stage, "dst": payload[i]["dst"], "out": out}
+                    rows[i] = {"ok": True, "seconds": seconds, "save_ref": ray.put(packed)}
+        except Exception as exc:
+            for i in good:
+                rows[i] = {"ok": False, "error": short_error(exc), "seconds": 0., "save_ref": None}
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+        return rows
+
     def compute(self, stage, dst, data):
         import gc
 
@@ -158,6 +212,15 @@ class StoreActor(_Cpu):
 class ActionReadActor(_Cpu):
     def __init__(self, robot="arx"):
         self.steps = _action_steps(robot)
+
+    def load_many(self, stage, units):
+        rows = []
+        for src, dst in units:
+            try:
+                rows.append({"ok": True, "dst": dst, "data": self.load(stage, src, dst)})
+            except Exception as exc:
+                rows.append({"ok": False, "dst": dst, "error": short_error(exc)})
+        return rows
 
     def load(self, stage, src, dst):
         return self.steps[stage].read(Path(src), Path(dst))

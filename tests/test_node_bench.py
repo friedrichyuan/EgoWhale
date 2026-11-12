@@ -90,3 +90,30 @@ def test_render_counts_prefix_and_only_processed_frames(tmp_path):
     node = FakeAction()
     node.name = "render"
     assert processed_frames(node, tmp_path, 12) == (16, "output_video_frames")
+
+
+def test_merge_separate_lines_and_reject_conflicts(tmp_path):
+    from egowhale.node_bench import prepare
+    class Merge(Step):
+        name="composite"
+        needs=("action/gripper.npz","visual/depth.npz")
+        makes=("visual/composite.mp4",)
+    roots=[tmp_path/"retarget",tmp_path/"depth"]
+    for root in roots:
+        root.mkdir()
+        (root/"pieces.json").write_text(json.dumps(dict(frames=2,limit=2,pieces=[[0,2]])))
+    for root,name in zip(roots,Merge.needs):
+        (root/name).parent.mkdir(parents=True)
+        (root/name).write_bytes(b"input")
+    prepare(Path("unused.hdf5"),tmp_path/"merged",roots,Merge(),2)
+    assert all((tmp_path/"merged"/n).is_file() for n in Merge.needs)
+    (roots[1]/"action").mkdir()
+    (roots[1]/"action/gripper.npz").symlink_to(roots[0]/"action/gripper.npz")
+    prepare(Path("unused.hdf5"),tmp_path/"same_source",roots,Merge(),2)
+    (roots[1]/"action/gripper.npz").unlink()
+    (roots[1]/"action/gripper.npz").write_bytes(b"different source")
+    with pytest.raises(ValueError,match="Conflicting"):
+        prepare(Path("unused.hdf5"),tmp_path/"conflict",roots,Merge(),2)
+    (roots[1]/"pieces.json").write_text(json.dumps(dict(frames=3,limit=3,pieces=[[0,3]])))
+    with pytest.raises(ValueError,match="Incompatible"):
+        prepare(Path("unused.hdf5"),tmp_path/"bad_plan",roots,Merge(),2)

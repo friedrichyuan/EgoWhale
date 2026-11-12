@@ -42,7 +42,7 @@ DEFAULTS = {
         "depth": {"cards": 1, "window": 1, "frames_per_forward": 96},
         # cuRobo. `ride: inpaint|depth` puts `actors_per_card` actors on every card of that node,
         # each holding `gpu_share` of it; otherwise the action node gets `cards` cards of its own.
-        "action": {"ride": None, "cards": 1, "actors_per_card": 1, "gpu_share": 0.1},
+        "action": {"ride": None, "cards": 1, "actors_per_card": 1, "gpu_share": 0.1, "batch_size": 0},
         # MuJoCo EGL render actors. They draw on the action cards.
         "render": {"actors": 4},
         # Composite and curate actors.
@@ -93,6 +93,17 @@ def load(path: Path | str, **overrides) -> dict:
     if config["nodes"]["inpaint"]["model"] not in MODELS:
         raise ConfigError(f"{path}: nodes.inpaint.model must be one of {', '.join(MODELS)}")
     action = config["nodes"]["action"]
+    batch_size = action["batch_size"]
+    if type(batch_size) is not int or batch_size < 0:
+        raise ConfigError("nodes.action.batch_size must be a nonnegative integer")
+    if batch_size:
+        from egowhale.action.episode_ik import episode_capacity
+        try:
+            capacity = episode_capacity(config["robot"], batch_size)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        if capacity > config["memory"]["inflight"]:
+            raise ConfigError("memory.inflight must be at least the episode batch capacity")
     if action["ride"] not in (None, "inpaint", "depth"):
         raise ConfigError(f"{path}: nodes.action.ride must be inpaint, depth, or empty")
     if action["ride"] and action["actors_per_card"] * action["gpu_share"] >= 1:

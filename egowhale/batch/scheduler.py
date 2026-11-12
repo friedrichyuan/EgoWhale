@@ -108,6 +108,13 @@ class Scheduler:
             )
         ]
 
+        self.episode_actions = None
+        batch_size = cfg["nodes"]["action"].get("batch_size", 0)
+        if batch_size:
+            from egowhale.action.episode_ik import episode_capacity
+            from egowhale.batch.episode_actions import EpisodeActions
+            self.episode_actions = EpisodeActions(self, episode_capacity(cfg.get("robot", "arx"), batch_size), batch_size)
+
     # Bookkeeping ---------------------------------------------------------------------------------------------
 
     def apply(self, units, rows, stage: str) -> None:
@@ -247,6 +254,9 @@ class Scheduler:
     # Action lanes --------------------------------------------------------------------------------------------
 
     def feed_actions(self) -> None:
+        if self.episode_actions is not None:
+            self.episode_actions.feed()
+            return
         taken = {id(job) for lane in self.action_lanes for job in (lane.job, lane.next_job) if job is not None}
         for lane in self.action_lanes:
             idle = lane.idle()

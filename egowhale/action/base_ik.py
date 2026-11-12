@@ -41,6 +41,14 @@ class BaseIK(Step):
     def save(self, dst: Path, out: dict) -> None:
         save_base(Path(dst), out)
 
+    def open_stream(self, batch_size):
+        from egowhale.action.episode_ik import EpisodeStream
+        return EpisodeStream(self.robot, batch_size)
+
+    def compute_batch(self, items: list[dict], batch_size: int) -> list[dict]:
+        from egowhale.action.episode_ik import compute_batch
+        return compute_batch(self.robot, items, batch_size)
+
     def compute(self, data: dict) -> dict:
         arms, bases, losses = [], {}, {}
         for group in self.robot.groups:

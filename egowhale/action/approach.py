@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from egowhale.media import FPS
+from egowhale.media import FPS, data_fps, valid_fps
 from egowhale.paths import IK, PREFIX
 from egowhale.robots import load_robot
 from egowhale.robots.motion import read_motion
@@ -27,7 +27,7 @@ class Approach(Step):
     def run(self, src: Path, dst: Path) -> None:
         prefix = self.compute(self.read(src, dst))
         self.save(dst, prefix)
-        print(f"  approach {len(prefix['joint_positions'])} frames  {(len(prefix['joint_positions']) - 1) / FPS:.2f}s")
+        print(f"  approach {len(prefix['joint_positions'])} frames  {(len(prefix['joint_positions']) - 1) / data_fps(prefix):.2f}s")
 
     def read(self, src: Path, dst: Path) -> dict:
         return read_ik(Path(dst))
@@ -36,6 +36,7 @@ class Approach(Step):
         save_prefix(Path(dst), out)
 
     def compute(self, data: dict) -> dict:
+        fps = data_fps(data)
         motion = data if "joint_positions" in data else self.robot.named(data["qpos"])
         names = list(motion["joint_names"])
         q = np.asarray(motion["joint_positions"], dtype=np.float64)
@@ -44,7 +45,7 @@ class Approach(Step):
             columns = [names.index(n) for n in group.joints]
             goal = q[0, columns]
             step = q[min(1, len(q) - 1), columns] - goal
-            paths.append((group, _trajopt(goal, group), goal, step))
+            paths.append((group, _trajopt(goal, group, fps=fps), goal, step))
         count = max(len(path) for _, path, _, _ in paths)
         result = np.zeros((count, len(names)), dtype=np.float32)
         arm_names = set()
@@ -58,7 +59,7 @@ class Approach(Step):
         goal = q[0, columns]
         step = q[min(1, len(q) - 1), columns] - goal
         result[:, columns] = _match_arrival(_ease(count) * goal, goal, step)
-        return {"joint_names": np.asarray(names), "joint_positions": result, "fps": np.float32(FPS)}
+        return {"joint_names": np.asarray(names), "joint_positions": result, "fps": np.float32(fps)}
 
 
 def read_ik(dst: Path) -> dict:
@@ -71,7 +72,7 @@ def save_prefix(dst: Path, result: dict) -> None:
     np.savez_compressed(path, **result)
 
 
-def _trajopt(goal: np.ndarray, group) -> np.ndarray:
+def _trajopt(goal: np.ndarray, group, fps=FPS) -> np.ndarray:
     from curobo.trajectory_optimizer import TrajectoryOptimizer, TrajectoryOptimizerCfg
     from curobo.types import JointState
 
@@ -95,8 +96,8 @@ def _trajopt(goal: np.ndarray, group) -> np.ndarray:
         position = position[0]
     dt = float(result.js_solution.dt.detach().float().cpu().reshape(-1)[0])
     samples = np.arange(len(position)) * dt
-    query = np.linspace(0.0, samples[-1], max(2, int(round(samples[-1] * FPS)) + 1))
-    arm = np.stack([np.interp(query, samples, position[:, index]) for index in range(position.shape[1])], axis=1)
+    query = np.linspace(0.0, samples[-1], max(2, int(round(samples[-1] * valid_fps(fps))) + 1))
+    arm = np.stack([np.interp(query, samples, column) for column in position.T], axis=1)
     arm = arm[:, [names.index(name) for name in group.joints]]
     arm[-1] = goal
     if np.linalg.norm(position[-1] - ordered.detach().cpu().numpy().reshape(-1)) > 1e-3:

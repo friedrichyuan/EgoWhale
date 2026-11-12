@@ -22,6 +22,7 @@ class SolveGroup:
     home: np.ndarray
     reach: float
     bounds: np.ndarray
+    batch_key: str | None = None  # Asset declaration: identical ordered kinematics across groups.
 
     def seed(self, position, valid):
         usable = valid.all(axis=1) if valid.all(axis=1).any() else valid.any(axis=1)

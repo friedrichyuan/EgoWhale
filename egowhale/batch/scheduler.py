@@ -110,8 +110,8 @@ class Scheduler:
 
         self.episode_actions = None
         batch_size = cfg["nodes"]["action"].get("batch_size", 0)
-        if batch_size:
-            from egowhale.action.episode_ik import episode_capacity
+        if cfg["nodes"]["action"].get("ik_method", "base_ik_seq" if batch_size else "base_ik") == "base_ik_seq":
+            from egowhale.action.base_ik_seq import episode_capacity
             from egowhale.batch.episode_actions import EpisodeActions
             self.episode_actions = EpisodeActions(self, episode_capacity(cfg.get("robot", "arx"), batch_size), batch_size)
 
@@ -399,7 +399,9 @@ def serve(jobs: list[Job], cfg: dict, pools: dict[str, int], share: dict[str, fl
     preflight(cfg, pools, share, height, width)
     journal = logger()
     model = cfg["nodes"]["inpaint"]["model"]
-    free = make_actors(pools, share, cfg["io"]["cpus"], cfg["nodes"]["depth"]["window"], model, cfg.get("robot", "arx"))
+    action = cfg["nodes"]["action"]
+    free = make_actors(pools, share, cfg["io"]["cpus"], cfg["nodes"]["depth"]["window"], model,
+                       cfg.get("robot", "arx"), action.get("ik_method") or ("base_ik_seq" if action["batch_size"] else "base_ik"), action["batch_size"])
     boot(free, journal, pools, {"inpaint": LABELS[model]})
     # Render and curate draw with EGL on the action cards, which cuRobo leaves mostly idle.
     cards = sorted({device.split(":")[-1] for device in ray.get([actor.ready.remote() for _label, actor in free["action"]])})

@@ -33,8 +33,8 @@ def _visual_steps(inpaint_model: str, window: int) -> dict:
     return {name: _visual_step(name, inpaint_model, window) for name in VISUAL}
 
 
-def _action_steps(robot="arx") -> dict:
-    return {name: make_step(STEPS[name], robot) for name in ACTION}
+def _action_steps(robot="arx", ik_method="base_ik", batch_size=0) -> dict:
+    return {name: make_step(STEPS[name], robot, ik_method=ik_method, batch_size=batch_size) for name in ACTION}
 
 
 class _Cpu:
@@ -73,8 +73,8 @@ class DepthActor(_Visual):
 
 
 class ActionActor(_Gpu):
-    def __init__(self, robot="arx"):
-        self.steps = _action_steps(robot)
+    def __init__(self, robot="arx", ik_method="base_ik", batch_size=0):
+        self.steps = _action_steps(robot, ik_method, batch_size)
 
     def advance_ik(self, payload, batch_size, start=0, count=0):
         """Transport adapter only: persistent IK state belongs to the node's stream."""
@@ -252,7 +252,7 @@ POOLS = {
 }
 
 
-def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, int], window: int, inpaint_model: str, robot: str = "arx"):
+def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, int], window: int, inpaint_model: str, robot: str = "arx", ik_method="base_ik", batch_size=0):
     """Every pool's actors as (label, handle). `share` is the GPU fraction for pools that stack on one card."""
     import ray
 
@@ -265,6 +265,8 @@ def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, 
             if name in share:
                 remote = remote.options(num_gpus=share[name])
             args = (inpaint_model, window) if configured else (robot,)
+            if name == "action":
+                args = (robot, ik_method, batch_size)
             made[name] = [(f"{name}{index}", remote.remote(*args)) for index in range(pools[name])]
 
     # Whole cards are placed before fractional ones so a shared card cannot take a slot a whole actor needs.

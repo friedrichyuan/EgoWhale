@@ -9,10 +9,12 @@ import os
 import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack
 from multiprocessing.util import Finalize
 from pathlib import Path
+from queue import Empty
 
-from egowhale.config import episodes
+from egowhale.config import DEFAULTS, ConfigError, episodes, ik_options, read_config
 from egowhale.paths import IK, PREFIX
 from egowhale.pieces import located, missing, pieces, plan
 
@@ -112,6 +114,70 @@ class _EpisodeRunner:
         self.loaded = False
         self.successes = 0
 
+    def stream(self, jobs):
+        """Read and write episodes around the same sequential solver used by the action actors."""
+        step = self.step
+        stream = step.open_stream()
+        source = iter(jobs)
+        live = {}
+        exhausted = False
+        try:
+            while not exhausted or live:
+                arrivals = []
+                for _ in range(stream.capacity - len(live)):
+                    job = next(source, None)
+                    if job is None:
+                        exhausted = True
+                        break
+                    src, dst, key = job
+                    row = dict(episode=str(src), output=str(dst), stage=step.name, status="failed")
+                    started = time.perf_counter()
+                    try:
+                        inputs = self.inputs_root
+                        roots = [root / key for root in inputs] if isinstance(inputs, list) else inputs / key if inputs else None
+                        prepare(src, dst, roots, step, self.piece_frames)
+                        read_at = time.perf_counter()
+                        data = step.read(src, dst)
+                        row["read_s"] = time.perf_counter() - read_at
+                    except Exception as exc:
+                        row.update(error=f"{type(exc).__name__}: {exc}", episode_wall_s=time.perf_counter() - started)
+                        yield row, 0.0
+                        continue
+                    token = str(dst)
+                    row["compute_s"] = 0.0
+                    live[token] = (row, started)
+                    arrivals.append((token, data))
+                if not live:
+                    continue
+                before = time.perf_counter()
+                completed = stream.advance(arrivals)
+                share = (time.perf_counter() - before) / len(live)
+                for row, _ in live.values():
+                    row["compute_s"] += share
+                for result in completed:
+                    token = result["token"]
+                    row, started = live.pop(token)
+                    try:
+                        if not result["ok"]:
+                            raise RuntimeError(result["error"])
+                        dst = Path(token)
+                        save_at = time.perf_counter()
+                        step.save(dst, result["out"])
+                        row["save_s"] = time.perf_counter() - save_at
+                        if absent := missing(dst, step.makes):
+                            raise RuntimeError(f"{step.name} did not write {absent}")
+                        row["frames"], row["frame_basis"] = processed_frames(step, dst, 0)
+                        row["node_s"] = row["read_s"] + row["compute_s"] + row["save_s"]
+                        row.update(status="ok", warmup=self.successes < self.warmup,
+                                   fps=row["frames"] / max(row["node_s"], 1e-12))
+                        self.successes += 1
+                    except Exception as exc:
+                        row["error"] = f"{type(exc).__name__}: {exc}"
+                    row["episode_wall_s"] = time.perf_counter() - started
+                    yield row, 0.0
+        finally:
+            stream.close()
+
     def run(self, src, dst, key):
         step = self.step
         inputs = self.inputs_root
@@ -184,8 +250,11 @@ def benchmark(step, sources, out, inputs_root=None, warmup=1, piece_frames=600):
     runner = _EpisodeRunner(step, inputs_root, warmup, piece_frames)
     def results():
         try:
-            for job in jobs:
-                yield runner.run(*job)
+            if getattr(step, "ik_method", None) == "base_ik_seq":
+                yield from runner.stream(jobs)
+            else:
+                for job in jobs:
+                    yield runner.run(*job)
         finally:
             step.release()
 
@@ -211,7 +280,7 @@ def _make_step(args):
         return Inpaint(args.inpaint_model)
     if cls is Depth:
         return Depth(args.window)
-    return make_step(cls, args.robot)
+    return make_step(cls, args.robot, ik_method=args.ik_method, batch_size=args.batch_size)
 
 
 _worker_runner = None
@@ -229,6 +298,43 @@ def _worker_run(job):
     row, load_s = _worker_runner.run(*job)
     row.update(worker_pid=os.getpid(), gpu=os.environ["CUDA_VISIBLE_DEVICES"])
     return row, load_s
+
+
+def _worker_stream(device, args, inputs, jobs, results):
+    _bind_device(args.stage, device)
+    step = _make_step(args)
+    runner = _EpisodeRunner(step, inputs, args.warmup, args.piece_frames)
+    try:
+        for row, load_s in runner.stream(jobs):
+            row.update(worker_pid=os.getpid(), gpu=device)
+            results.put((row, load_s))
+    finally:
+        step.release()
+
+
+def _parallel_stream(jobs, devices, args, inputs):
+    # Each device owns one fixed shard and one stream; publish results as episodes finish.
+    ctx = mp.get_context("spawn")
+    with ctx.Manager() as manager, ExitStack() as stack:
+        results = manager.Queue()
+        futures = []
+        for index, device in enumerate(devices):
+            pool = stack.enter_context(ProcessPoolExecutor(max_workers=1, mp_context=ctx))
+            futures.append(pool.submit(_worker_stream, device, args, inputs, jobs[index::len(devices)], results))
+        while True:
+            try:
+                yield results.get(timeout=0.5)
+            except Empty:
+                if not all(future.done() for future in futures):
+                    continue
+                for future in futures:
+                    future.result()
+                # A worker may have published its final row just after the timed get.
+                while True:
+                    try:
+                        yield results.get_nowait()
+                    except Empty:
+                        return
 
 
 def _parallel_results(jobs, devices, args, inputs):
@@ -257,22 +363,52 @@ def _parallel_results(jobs, devices, args, inputs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("retarget", "segment", "inpaint", "depth", "base_ik", "approach", "render", "composite", "curate"))
-    parser.add_argument("--episodes", nargs="+", required=True, help="HDF5 files, directories, or text lists")
-    parser.add_argument("--out", type=Path, required=True, help="fresh output root; episodes stored under task/name")
-    parser.add_argument("--inputs-root", type=Path, nargs="+", help="one or more upstream roots with identical task/name and piece layout")
-    parser.add_argument("--robot", choices=("arx", "piper", "dual_piper"), default="arx")
-    parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--warmup", type=int, default=1, help="successful episodes per worker excluded from after_warmup metrics")
+    parser.add_argument("--config", type=Path, help="batch or node benchmark YAML")
+    parser.add_argument("--episodes", nargs="+", help="HDF5 files, directories, or text lists")
+    parser.add_argument("--out", type=Path, help="fresh output root; episodes stored under task/name")
+    parser.add_argument("--inputs-root", type=Path, nargs="+", help="upstream roots with identical task/name and piece layout")
+    parser.add_argument("--robot", choices=("arx", "piper", "dual_piper"))
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--warmup", type=int, help="successful episodes per worker excluded from after_warmup metrics")
     parser.add_argument("--workers", type=int, help="persistent processes; default one per visible GPU, or one for composite")
-    parser.add_argument("--piece-frames", type=int, default=600)
-    parser.add_argument("--inpaint-model", choices=("sttn", "propainter"), default="sttn")
-    parser.add_argument("--window", type=int, default=1, help="depth views per window")
+    parser.add_argument("--piece-frames", type=int)
+    parser.add_argument("--inpaint-model", choices=("sttn", "propainter"))
+    parser.add_argument("--window", type=int, help="depth views per window")
     args = parser.parse_args()
+    try:
+        cfg = read_config(args.config) if args.config else DEFAULTS
+        node = cfg["node_bench"]
+        roots = node["inputs_root"]
+        defaults = dict(episodes=cfg["episodes"], robot=cfg["robot"], limit=cfg["limit"],
+                        piece_frames=cfg["piece_frames"], workers=node["workers"], warmup=node["warmup"],
+                        inputs_root=[roots] if isinstance(roots, str) else roots,
+                        inpaint_model=cfg["nodes"]["inpaint"]["model"], window=cfg["nodes"]["depth"]["window"])
+        if args.config:
+            defaults["out"] = Path(cfg["out"]).expanduser() / cfg["name"]
+            if not defaults["out"].is_absolute():
+                from egowhale.paths import ROOT
+                defaults["out"] = ROOT / defaults["out"]
+        for key, value in defaults.items():
+            if getattr(args, key) is None:
+                setattr(args, key, value)
+        args.ik_method, args.batch_size, args.episode_capacity = (
+            ik_options(cfg["nodes"]["action"], args.robot) if args.stage == "base_ik" else ("base_ik", 0, 0)
+        )
+        if args.robot not in ("arx", "piper", "dual_piper"):
+            raise ConfigError("robot must be arx, piper or dual_piper")
+        if args.inpaint_model not in ("sttn", "propainter"):
+            raise ConfigError("inpaint model must be sttn or propainter")
+        if any(type(value) is not int for value in (args.limit, args.warmup, args.piece_frames, args.window)):
+            raise ConfigError("limit, warmup, piece_frames and window must be integers")
+    except (ConfigError, OSError, TypeError) as exc:
+        parser.error(str(exc))
+    if not args.episodes or args.out is None:
+        parser.error("provide --episodes and --out or their equivalents in --config")
     if args.limit < 0 or args.warmup < 0 or args.piece_frames < 1 or args.window < 1:
         parser.error("invalid negative count or zero window/piece size")
-    if args.workers is not None and args.workers < 1:
+    if args.workers is not None and (type(args.workers) is not int or args.workers < 1):
         parser.error("--workers must be positive")
-    sources = episodes(dict(episodes=args.episodes, order="list", limit=args.limit))
+    sources = episodes(dict(episodes=args.episodes, order=cfg["order"], seed=cfg["seed"], limit=args.limit))
     if not sources:
         parser.error("no episodes")
     out = args.out.expanduser().resolve()
@@ -290,7 +426,7 @@ def main():
             parser.error("CUDA_VISIBLE_DEVICES must list distinct GPUs")
     count = min(args.workers or len(cards), len(sources))
     devices = [cards[index % len(cards)] for index in range(count)]
-    inputs = [p.expanduser().resolve() for p in args.inputs_root] if args.inputs_root else None
+    inputs = [Path(p).expanduser().resolve() for p in args.inputs_root] if args.inputs_root else None
 
     if count == 1:
         _bind_device(args.stage, devices[0])
@@ -308,7 +444,8 @@ def main():
                 parser.error(f"{args.stage} requires --inputs-root; upstream nodes are not run automatically")
         jobs = _jobs(sources, out)
         started = time.perf_counter()
-        summary = _record(_parallel_results(jobs, devices, args, inputs), out, started)
+        parallel = _parallel_stream if args.ik_method == "base_ik_seq" else _parallel_results
+        summary = _record(parallel(jobs, devices, args, inputs), out, started)
     config = {
         **vars(args), "out": str(out), "episodes_resolved": [str(p) for p in sources],
         "mode": "serial_persistent_node" if count == 1 else "parallel_persistent_nodes",

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from egowhale.action import episode_ik as module
+from egowhale.action import base_ik_seq as module
 from egowhale.batch.dag import Job
 from egowhale.batch.episode_actions import EpisodeActions, choose
 

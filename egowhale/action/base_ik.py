@@ -25,9 +25,11 @@ class BaseIK(Step):
     makes = (BASE, IK)
     gpus = 1
 
-    def __init__(self, robot="arx"):
+    def __init__(self, robot="arx", ik_method="base_ik", batch_size=0):
         super().__init__()
         self.robot = load_robot(robot)
+        self.ik_method = ik_method
+        self.batch_size = batch_size
 
     def run(self, src: Path, dst: Path) -> None:
         result = self.compute(self.read(src, dst))
@@ -41,15 +43,17 @@ class BaseIK(Step):
     def save(self, dst: Path, out: dict) -> None:
         save_base(Path(dst), out)
 
-    def open_stream(self, batch_size):
-        from egowhale.action.episode_ik import EpisodeStream
-        return EpisodeStream(self.robot, batch_size)
+    def open_stream(self, batch_size=None):
+        from egowhale.action.base_ik_seq import EpisodeStream
+        return EpisodeStream(self.robot, self.batch_size if batch_size is None else batch_size)
 
     def compute_batch(self, items: list[dict], batch_size: int) -> list[dict]:
-        from egowhale.action.episode_ik import compute_batch
+        from egowhale.action.base_ik_seq import compute_batch
         return compute_batch(self.robot, items, batch_size)
 
     def compute(self, data: dict) -> dict:
+        if self.ik_method == "base_ik_seq":
+            return self.compute_batch([data], self.batch_size)[0]
         arms, bases, losses = [], {}, {}
         for group in self.robot.groups:
             sides = list(group.sides)

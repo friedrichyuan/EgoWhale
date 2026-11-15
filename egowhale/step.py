@@ -47,6 +47,9 @@ class Step:
         # One GPU section at a time. A batch actor copies results out after releasing it.
         self.lock = threading.Lock()
 
+    def validate_outputs(self, src: Path, dst: Path) -> None:
+        """Validate resumable outputs before skipping; stages may reject stale files."""
+
     def load(self) -> None:
         """Acquire weights. A no-op when they are held, or when the stage has none."""
 
@@ -82,6 +85,7 @@ def run(src: Path | str, dst: Path | str, steps: tuple[type[Step] | Step, ...]) 
     plan(src, dst)
     for given in steps:
         step = given if isinstance(given, Step) else given()
+        step.validate_outputs(src, dst)
         if not missing(dst, step.makes):
             print(f"skip {step.name}")
             continue
@@ -104,6 +108,7 @@ def execute(step: Step, src: Path | str, dst: Path | str, index: int | None = No
     """Run one stage, or one piece of it, with its prints kept quiet. A finished unit is skipped, not run."""
     src, dst = Path(src), Path(dst)
     where = dst if index is None else piece_dir(dst, index, len(pieces(dst)))
+    step.validate_outputs(src, dst)
     outputs = [where / name for name in step.makes]
     if all(path.is_file() for path in outputs):
         return Result(False)

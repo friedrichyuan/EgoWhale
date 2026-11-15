@@ -1,0 +1,14 @@
+# Full batch pipeline using WiLoR instead of EgoDex hand annotations.
+# GPU needs: the default segment/inpaint/depth/action pools plus 1 WiLoR GPU.
+# Use the serial --steps wilor command for a standalone single-GPU test.
+name: wilor
+hand_source: wilor
+episodes: datasets/egodex/test/paint_clean_brush/14.mp4
+out: outputs
+nodes:
+  wilor:
+    enabled: true
+    cards: 1
+    camera_mode: wilor-default
+    # For a calibrated control, set camera_mode: egodex and provide calibration:
+    # calibration: datasets/egodex/test/paint_clean_brush/14.hdf5

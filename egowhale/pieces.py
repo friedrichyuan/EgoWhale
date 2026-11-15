@@ -29,10 +29,10 @@ def plan(src: Path | str, dst: Path | str, limit: int = PIECE) -> list[tuple[int
         if marked["limit"] == limit:
             return [tuple(span) for span in marked["pieces"]]
     frames = frame_count(src)
-    from egowhale.media import video_shape
+    from egowhale.media import video_path, video_shape
 
     # Later stages read as many video frames as the HDF5 has poses; a shorter video would be cut silently.
-    video = video_shape(Path(src).with_suffix(".mp4"))[0]
+    video = video_shape(video_path(Path(src)))[0]
     if video != frames:
         raise ValueError(f"{src}: video has {video} frames, HDF5 has {frames}")
     spans = split(frames, limit)
@@ -68,5 +68,13 @@ def missing(dst: Path | str, names: tuple[str, ...]) -> list[str]:
 def frame_count(src: Path | str) -> int:
     import h5py
 
+    src = Path(src)
+    if src.suffix not in (".hdf5", ".h5"):
+        from egowhale.media import video_shape
+
+        count = video_shape(src)[0]
+        if count <= 0:
+            raise ValueError(f"empty video: {src}")
+        return count
     with h5py.File(src) as handle:
         return int(handle["transforms/camera"].shape[0])

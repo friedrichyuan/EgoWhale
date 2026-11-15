@@ -31,3 +31,6 @@ known-first-party = ["egowhale"]
 
 [tool.ruff.lint.per-file-ignores]
 "tools/*.py" = ["E402"]
+
+[tool.setuptools.package-data]
+"egowhale.wilor" = ["cfgs/*.yaml", "scripts/*.sh"]

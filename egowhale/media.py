@@ -17,6 +17,12 @@ MASK_DILATION = 4
 _RESIZE_THREADS = 8
 
 
+def video_path(src: Path) -> Path:
+    """Resolve an episode video without requiring annotations."""
+    src = Path(src)
+    return src.with_suffix(".mp4") if src.suffix in (".hdf5", ".h5") else src
+
+
 def save_masks(path: Path, masks: np.ndarray) -> None:
     path = Path(path)
     masks = np.asarray(masks, dtype=bool)

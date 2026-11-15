@@ -11,6 +11,8 @@ ASSETS = ROOT / "assets"
 OUTPUTS = ROOT / "outputs"
 
 # One episode's files, relative to its output directory. Visual files in PER_PIECE live per piece.
+HANDS_WILOR = "action/hands_wilor.npz"
+HANDS_WILOR_META = "action/hands_wilor.json"
 GRIPPER = "action/gripper.npz"
 MASKS = "visual/masks.npz"
 INPAINT = "visual/inpaint.mp4"

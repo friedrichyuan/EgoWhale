@@ -90,6 +90,7 @@ def measure(step, src, dst):
 
 def summarize(rows, load_s, wall_s):
     good = [r for r in rows if r["status"] == "ok"]
+    rejected = sum(r["status"] == "rejected" for r in rows)
     steady = [r for r in good if not r["warmup"]]
     def aggregate(items):
         frames = sum(r["frames"] for r in items)
@@ -98,7 +99,7 @@ def summarize(rows, load_s, wall_s):
         return dict(episodes=len(items), frames=frames, node_s=seconds,
                     node_fps=frames/seconds if seconds else None,
                     compute_fps=frames/compute if compute and all("compute_s" in r for r in items) else None)
-    return dict(ok=len(good), failed=len(rows)-len(good), load_s=load_s, wall_s=wall_s,
+    return dict(ok=len(good), failed=len(rows)-len(good)-rejected, rejected=rejected, load_s=load_s, wall_s=wall_s,
                 all_successful=aggregate(good), after_warmup=aggregate(steady),
                 overall_fps=sum(r["frames"] for r in good)/wall_s if wall_s else None)
 
@@ -158,6 +159,8 @@ class _EpisodeRunner:
                     token = result["token"]
                     row, started = live.pop(token)
                     try:
+                        if result.get("no_base"):
+                            row["status"] = "rejected"
                         if not result["ok"]:
                             raise RuntimeError(result["error"])
                         dst = Path(token)
@@ -202,6 +205,11 @@ class _EpisodeRunner:
             self.successes += 1
             row["fps"] = row["frames"] / max(row["node_s"], 1e-12)
         except Exception as exc:
+            if step.name == "base_ik":
+                from egowhale.action.base_ik import NoBaseCandidate
+
+                if isinstance(exc, NoBaseCandidate):
+                    row["status"] = "rejected"
             row["error"] = f"{type(exc).__name__}: {exc}"
         if callable(getattr(step, "compute", None)):
             # cuRobo solver reference cycles must not accumulate between episodes.

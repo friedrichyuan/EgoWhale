@@ -85,7 +85,7 @@ def test_piper_urdf_matches_mjcf_fk():
 @pytest.mark.parametrize("name", ["arx", "piper"])
 def test_node_io_and_group_dispatch_without_gpu(tmp_path, monkeypatch, name, fps):
     calls = []
-    def solve(position, rotation, valid, group, fps):
+    def solve(position, rotation, valid, group, fps, periodic=None):
         assert fps == data["fps"]
         calls.append((group.name, position.copy()))
         return np.eye(4), np.repeat(group.home[None], len(position), axis=0), {"position": 0., "jerk": 0.}

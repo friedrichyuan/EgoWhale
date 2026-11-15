@@ -214,24 +214,36 @@ def test_real_backend_fixed_width_and_episode_state(monkeypatch, name, capacity)
 
     robot = load_robot(name)
     groups = {id(g.config): g for g in robot.groups}
+    allocated_widths = []
 
     class Solver:
         def __init__(self, cfg):
             self.group = groups[id(cfg["robot"])]
             self.joint_names = list(self.group.joints)[::-1]
             self.width = cfg["max_batch_size"]
+            allocated_widths.append(self.width)
+            self.seed_ik_solver = SimpleNamespace(config=SimpleNamespace(use_cuda_graph=True))
 
-        def solve_pose(self, goal_tool_poses, current_state):
+        def solve_pose(self, goal_tool_poses, current_state, return_seeds):
             # Model a cuRobo solver that reuses buffers sized for the configured batch.
             assert len(current_state.position) == self.width
+            assert not self.seed_ik_solver.config.use_cuda_graph
             for pose in goal_tool_poses.values():
                 assert len(pose.position) == len(pose.quaternion) == self.width
                 torch.testing.assert_close(pose.quaternion.norm(dim=-1), torch.ones(self.width))
             values = current_state.position + 0.001
+            home = torch.as_tensor(self.group.home.copy()[::-1].copy(), dtype=values.dtype)
+            first = (current_state.position == home).all(dim=-1, keepdim=True)
+            distant = torch.where(first, values, values + 0.5)
             # Exercise returned joint order differing from solver order.
             return SimpleNamespace(
-                js_solution=SimpleNamespace(position=values.flip(-1)[:, None], joint_names=list(self.group.joints)),
-                position_error=torch.zeros((len(values), 1)),
+                js_solution=SimpleNamespace(
+                    position=torch.stack((distant, values), dim=1).flip(-1),
+                    joint_names=list(self.group.joints),
+                ),
+                success=torch.ones((len(values), return_seeds), dtype=torch.bool),
+                position_error=torch.zeros((len(values), return_seeds)),
+                rotation_error=torch.zeros((len(values), 1)),
             )
 
     types = SimpleNamespace(
@@ -259,7 +271,7 @@ def test_real_backend_fixed_width_and_episode_state(monkeypatch, name, capacity)
         torch, "as_tensor", lambda x, **kw: original(x, **{k: v for k, v in kw.items() if k != "device"})
     )
     seen_fps = []
-    def refine(kin, p, r, v, sr, st, o, a, g, fps):
+    def refine(kin, p, r, v, sr, st, o, a, g, fps, geometry=None, periodic=None):
         seen_fps.append(fps)
         return o, a, {"position": 0.0}
     monkeypatch.setattr(core, "_refine", refine)
@@ -297,6 +309,8 @@ def test_real_backend_fixed_width_and_episode_state(monkeypatch, name, capacity)
     assert s.advance() == []
     tail, = s.advance()
     assert tail["ok"] and tail["token"] == 0 and not s.active
+    assert min(allocated_widths) == batch_size // capacity
+    assert max(allocated_widths) == batch_size
     q = tail["out"]["joint_positions"]
     names = list(tail["out"]["joint_names"])
     for g in robot.groups:
@@ -349,3 +363,301 @@ def test_actor_returns_short_result_with_long_still_live(monkeypatch):
     assert set(actor.ik_seconds) == {"long"}
     result = actor.advance_ik([dict(ok=False, dst="failed_read", error="read failed")], 324, 0, 1)
     assert result["rows"][0]["token"] == "failed_read" and result["live"] == ["long"]
+
+
+def test_jump_repair_preserves_pose_near_joint_limit():
+    import mujoco
+    from scipy.spatial.transform import Rotation
+
+    from egowhale.action.sequential_ik import _repair_jumps
+    from egowhale.robots import load_robot
+
+    robot = load_robot("piper")
+    group = robot.groups[0]
+    model = robot.model
+    data = mujoco.MjData(model)
+    joints = [model.joint(name).qposadr[0] for name in group.joints]
+    site = model.site(robot.tcp_sites[0]).id
+    trajectory = np.tile(group.home, (30, 1))
+    trajectory[:15, -1] = np.deg2rad(-179)
+    trajectory[15:, -1] = np.deg2rad(179)
+
+    def fk(path):
+        positions, rotations = [], []
+        for q in path:
+            data.qpos[joints] = q
+            mujoco.mj_kinematics(model, data)
+            positions.append(data.site_xpos[site].copy())
+            rotations.append(data.site_xmat[site].reshape(3, 3).copy())
+        return np.asarray(positions), np.asarray(rotations)
+
+    p, r = fk(trajectory)
+    repaired, before, after, _ = _repair_jumps(
+        robot, group, np.eye(4), trajectory, p[:, None], r[:, None], np.ones((30, 1), bool), 18,
+    )
+    assert (before, after) == (0, 0)
+    np.testing.assert_array_equal(repaired, trajectory)
+    actual_p, actual_r = fk(repaired)
+    assert np.linalg.norm(actual_p - p, axis=1).max() <= 0.01
+    assert Rotation.from_matrix(actual_r @ r.transpose(0, 2, 1)).magnitude().max() <= np.deg2rad(10)
+
+
+def test_periodic_selection_does_not_switch_to_far_elbow_branch():
+    from egowhale.action.sequential_ik import _continuous_solution
+
+    positions = torch.deg2rad(torch.tensor([[[-179.], [120.]]]))
+    result = SimpleNamespace(js_solution=SimpleNamespace(joint_names=["axis"], position=positions),
+                             success=torch.tensor([[True, True]]), position_error=torch.tensor([[.001, .002]]))
+    previous = torch.deg2rad(torch.tensor([[179.]]))
+    q, error = _continuous_solution(result, previous, torch.tensor([True]), ["axis"], torch.tensor([True]))
+    torch.testing.assert_close(q, positions[:, 0])
+    assert error.item() == pytest.approx(.001)
+    q, _ = _continuous_solution(result, previous, torch.tensor([True]), ["axis"], torch.tensor([False]))
+    torch.testing.assert_close(q, positions[:, 1])
+
+
+def test_angle_lift_is_geometric_and_export_stays_bounded():
+    from egowhale.action import base_ik as core
+
+    arm = np.deg2rad([[179., 10.], [-179., 20.], [-175., 30.]])
+    mask = np.array([True, False])
+    lifted = core._lift_angles(arm, mask)
+    np.testing.assert_allclose(np.rad2deg(lifted[:, 0]), [179., 181., 185.])
+    np.testing.assert_array_equal(lifted[:, 1], arm[:, 1])
+    lo, hi = torch.deg2rad(torch.tensor([-179.9, -30.])), torch.deg2rad(torch.tensor([179.9, 90.]))
+    bounded = core._bounded_angles(torch.as_tensor(lifted), lo, hi, torch.as_tensor(mask))
+    np.testing.assert_allclose(bounded.numpy(), arm, atol=1e-6)
+    assert torch.all(bounded >= lo) and torch.all(bounded <= hi)
+    np.testing.assert_allclose(np.rad2deg(core._joint_delta(arm[1:], arm[:-1], mask))[:, 0], [2., 4.])
+
+
+def test_asset_rotation_mask_excludes_sliders_and_short_ranges():
+    import mujoco
+
+    from egowhale.action import base_ik as core
+
+    kinds = [mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE, mujoco.mjtJoint.mjJNT_HINGE]
+    robot = SimpleNamespace(model=SimpleNamespace(joint=lambda n: SimpleNamespace(type=[kinds[n]])))
+    group = SimpleNamespace(joints=[0, 1, 2], lower=np.zeros(3), upper=np.array([2*np.pi, 10., 5.]))
+    np.testing.assert_array_equal(core._periodic_joints(robot, group), [True, False, False])
+
+
+@pytest.fixture
+def interval_robot():
+    """Small analytical model, independent of repository asset files and CUDA."""
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body>
+      <joint name="turn" type="hinge" axis="0 0 1" range="-170 170"/>
+      <geom type="sphere" size=".01" mass="1"/>
+      <site name="tcp_a"/><site name="tcp_b" quat="0 1 0 0"/>
+    </body></worldbody></mujoco>""")
+    group = SimpleNamespace(name="arm", joints=["turn"], sides=[0, 1],
+                            lower=np.deg2rad(np.array([-170.])), upper=np.deg2rad(np.array([170.])))
+    robot = SimpleNamespace(model=model, tcp_sites=["tcp_a", "tcp_b"], place_bases=lambda m, b: None)
+    return robot, group
+
+
+def test_local_constraint_repair_checks_both_tcp_and_seams(interval_robot):
+    from scipy.spatial.transform import Rotation
+
+    from egowhale.action.sequential_ik import _constrained_interval
+
+    robot, group = interval_robot
+    trajectory = np.deg2rad(np.r_[np.full(10, -50.), np.full(10, 50.)])[:, None].astype(np.float32)
+    position = np.zeros((20, 2, 3))
+    rotation = np.tile(np.eye(3), (20, 2, 1, 1))
+    rotation[:, 1] = Rotation.from_rotvec([np.pi, 0, 0]).as_matrix()
+    valid = np.ones((20, 2), bool)
+    arm = _constrained_interval(robot, group, np.eye(4), trajectory, trajectory, position, rotation,
+                                valid, 4, 16, np.deg2rad(60))
+    assert arm is not None and arm.dtype == trajectory.dtype
+    joined = np.r_[trajectory[3:4], arm, trajectory[16:17]]
+    assert np.max(abs(np.diff(joined, axis=0))) <= np.deg2rad(60) + 1e-6
+    assert np.max(abs(arm)) <= np.deg2rad(60)
+    # The second TCP tracks the original discontinuous targets exactly. Its
+    # 10-degree allowance cannot bridge a 100-degree edge with a 60-degree cap.
+    rotation[:, 1] = Rotation.from_rotvec(np.c_[np.zeros((20, 2)), trajectory[:, 0]]).as_matrix() @ rotation[:, 1]
+    assert _constrained_interval(robot, group, np.eye(4), trajectory, trajectory, position, rotation,
+                                 valid, 4, 16, np.deg2rad(60)) is None
+
+
+def test_local_constraint_does_not_accumulate_pose_allowance(interval_robot):
+    from scipy.spatial.transform import Rotation
+
+    from egowhale.action.sequential_ik import _constrained_interval
+
+    robot, group = interval_robot
+    reference = np.deg2rad(np.r_[np.full(10, -50.), np.full(10, 50.)])[:, None]
+    rotation = Rotation.from_rotvec(np.c_[np.zeros((20, 2)), reference[:, 0]]).as_matrix()
+    rotation = np.stack((rotation, rotation @ Rotation.from_rotvec([np.pi, 0, 0]).as_matrix()), 1)
+    current = reference * .85
+    # A prior attempt already used 7.5 degrees of the orientation allowance.
+    # Referencing current would incorrectly grant a second allowance.
+    assert _constrained_interval(robot, group, np.eye(4), current, reference,
+                                 np.zeros((20, 2, 3)), rotation, np.ones((20, 2), bool),
+                                 4, 16, np.deg2rad(60)) is None
+
+
+@pytest.mark.parametrize("rotvec", [[0., 0., 0.], [.1, -.2, .3], [1.5, -.6, 1.1]])
+def test_rotation_log_world_jacobian_matches_difference(rotvec):
+    from scipy.spatial.transform import Rotation
+
+    from egowhale.action.sequential_ik import _rotation_log_jacobian
+
+    rotvec = np.array(rotvec)
+    rotation = Rotation.from_rotvec(rotvec)
+    eps = 1e-6
+    actual = np.column_stack([
+        ((Rotation.from_rotvec(axis * eps) * rotation).as_rotvec()
+         - (Rotation.from_rotvec(-axis * eps) * rotation).as_rotvec()) / (2 * eps)
+        for axis in np.eye(3)
+    ])
+    np.testing.assert_allclose(_rotation_log_jacobian(rotvec), actual, atol=1e-8, rtol=1e-6)
+
+
+def test_severe_retry_is_bounded_and_keeps_reference(monkeypatch, interval_robot):
+    from egowhale.action import sequential_ik
+
+    robot, group = interval_robot
+    q = np.deg2rad(np.r_[np.full(20, -50.), np.full(20, 50.)])[:, None]
+    reference = q.copy()
+    calls = []
+
+    def retry(robot, group, base, current, ref, position, rotation, valid, start, stop, cap, linear):
+        assert ref is reference
+        calls.append((start, stop, cap, linear))
+        if len(calls) < 5:
+            return None
+        return np.linspace(current[start-1], current[stop], stop-start+2)[1:-1]
+
+    monkeypatch.setattr(sequential_ik, "_constrained_interval", retry)
+    result = sequential_ik._repair_severe_jumps(
+        robot, group, np.eye(4), q, reference, np.zeros((40, 2, 3)),
+        np.tile(np.eye(3), (40, 2, 1, 1)), np.ones((40, 2), bool), 18,
+    )
+    assert len(calls) == 5
+    assert calls[-1][2] == pytest.approx(np.deg2rad(85))
+    assert not np.array_equal(result, q)
+    np.testing.assert_array_equal(q, reference)
+
+
+def test_local_repair_retains_valid_iterate_when_last_step_fails(monkeypatch, interval_robot):
+    from scipy.spatial.transform import Rotation
+
+    from egowhale.action import sequential_ik
+
+    robot, group = interval_robot
+    q = np.deg2rad(np.r_[np.full(10, -50.), np.full(10, 50.)])[:, None]
+    rotations = np.tile(np.eye(3), (20, 2, 1, 1))
+    rotations[:, 1] = Rotation.from_rotvec([np.pi, 0, 0]).as_matrix()
+
+    def optimizer(fun, x, **kwargs):
+        kwargs["callback"](np.zeros_like(x))  # Valid Cartesian pose and both seams.
+        return SimpleNamespace(x=np.full_like(x, np.pi / 2), success=False)
+
+    monkeypatch.setattr(sequential_ik, "minimize", optimizer)
+    result = sequential_ik._constrained_interval(
+        robot, group, np.eye(4), q, q, np.zeros((20, 2, 3)), rotations,
+        np.ones((20, 2), bool), 4, 16, np.deg2rad(60),
+    )
+    assert result is not None
+    np.testing.assert_array_equal(result, np.zeros((12, 1)))
+
+
+def test_branch_path_pins_seams_and_checks_each_tcp():
+    from egowhale.action.sequential_ik import _branch_path
+    original = np.array([-.8, -.8, .8, .8, .8])[:, None]
+    smooth = np.linspace(-.8, .8, 5)[:, None]
+    pool = np.stack([original, smooth], axis=1)
+    pe = np.zeros((5, 2, 2))
+    re = np.zeros_like(pe)
+    reference = np.zeros((5, 2))
+    valid = np.ones((5, 2), bool)
+    arguments = (reference, reference, valid, np.array([False]), np.array([-1.]), np.array([1.]))
+    result = _branch_path(pool, pe, re, *arguments, fixed_first=True, fixed_last=True)
+    np.testing.assert_allclose(result, smooth)
+    np.testing.assert_array_equal(result[[0, -1]], original[[0, -1]])
+    # Only the second TCP fails. Averaging tools would incorrectly admit this pose.
+    pe[2, 1, 1] = .003
+    result = _branch_path(pool, pe, re, *arguments, fixed_first=True, fixed_last=True)
+    np.testing.assert_array_equal(result[2], original[2])
+    valid[2, 1] = False
+    result = _branch_path(pool, pe, re, *arguments, fixed_first=True, fixed_last=True)
+    np.testing.assert_allclose(result, smooth)
+
+
+def test_branch_path_budget_is_frozen_and_limits_are_not_solver_success():
+    from egowhale.action.sequential_ik import _branch_path
+    original = np.array([-.8, -.8, .8, .8, .8])[:, None]
+    smooth = np.linspace(-.8, .8, 5)[:, None]
+    pool = np.stack([original, smooth], axis=1)
+    pe = np.full((5, 2, 1), .01)
+    re = np.zeros_like(pe)
+    ref = np.zeros((5, 1))
+    args = (ref, ref, np.ones((5, 1), bool), np.array([False]), np.array([-1.]), np.array([1.]))
+    # An earlier repair spent its allowance; comparing to that intermediate would accumulate it.
+    result = _branch_path(pool, pe, re, *args, fixed_first=True, fixed_last=True)
+    np.testing.assert_array_equal(result, original)
+    pe[:] = 0
+    pool[2, 1, 0] = 1.1
+    result = _branch_path(pool, pe, re, *args, fixed_first=True, fixed_last=True)
+    assert result[2, 0] == original[2, 0]
+    pool[2, 1, 0] = np.nan
+    result = _branch_path(pool, pe, re, *args, fixed_first=True, fixed_last=True)
+    assert np.isfinite(result).all()
+
+
+def test_branch_windows_are_bounded_and_ignore_angle_coordinate_cuts():
+    from egowhale.action.sequential_ik import _BRANCH_REGIONS, _branch_windows
+    arm = np.zeros((300, 2))
+    arm[:, 0] = np.where(np.arange(300) % 2, -np.deg2rad(179), np.deg2rad(179))
+    assert _branch_windows(arm, np.array([True, False]), 18) == []
+    for frame in range(20, 290, 30):
+        arm[frame:, 1] += 1.
+    windows = _branch_windows(arm, np.array([True, False]), 18)
+    assert len(windows) == _BRANCH_REGIONS
+    assert all(0 <= lo < hi <= len(arm) and hi-lo <= 24 for lo, hi in windows)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires allocated GPU")
+@pytest.mark.parametrize("asset", ["piper", "arx"])
+def test_branch_candidate_tail_projection_and_fk_match_mujoco(asset):
+    import mujoco
+    from curobo.kinematics import Kinematics, KinematicsCfg
+    from scipy.spatial.transform import Rotation
+
+    from egowhale.action import base_ik as core
+    from egowhale.action.sequential_ik import _BranchRepair
+    from egowhale.robots import load_robot
+
+    robot = load_robot(asset)
+    group = robot.groups[0]
+    kin = Kinematics(KinematicsCfg.from_robot_yaml_file(group.config, tool_frames=list(group.tools)))
+    repair = _BranchRepair(group, kin)
+    q = np.tile(group.home, (2, 1)).astype(np.float32)
+    base = np.eye(4)
+    pp, qq = repair._poses(q, base)
+    position = pp.cpu().numpy()
+    quat = qq.cpu().numpy()
+    rotation = Rotation.from_quat(quat.reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix().reshape(2, -1, 3, 3)
+    # 2*63 rows exercises the fixed-width padded tail, on consecutive cached calls.
+    for _ in range(2):
+        pool = repair._pool(q, base, position, rotation, core._periodic_joints(robot, group), group.lower, group.upper)
+        assert pool.shape == (2, 505, len(group.joints))
+        np.testing.assert_array_equal(pool[:, 0], q)
+        assert np.isfinite(pool).all()
+        assert ((pool >= group.lower-1e-6) & (pool <= group.upper+1e-6)).all()
+        pe, re = repair._errors(pool[:, [0, 1, -1]], base, position, rotation)
+        robot.place_bases(robot.model, {group.name: base})
+        data = mujoco.MjData(robot.model)
+        idx = [robot.model.joint(n).qposadr[0] for n in group.joints]
+        sites = [robot.model.site(robot.tcp_sites[s]).id for s in group.sides]
+        for frame in range(2):
+            for column, candidate in enumerate([0, 1, pool.shape[1]-1]):
+                data.qpos[idx] = pool[frame, candidate]
+                mujoco.mj_kinematics(robot.model, data)
+                actual_p = np.linalg.norm(data.site_xpos[sites]-position[frame], axis=-1)
+                actual_r = Rotation.from_matrix(data.site_xmat[sites].reshape(-1, 3, 3) @ rotation[frame].transpose(0, 2, 1)).magnitude()
+                np.testing.assert_allclose(pe[frame, column], actual_p, atol=1e-5)
+                np.testing.assert_allclose(re[frame, column], actual_r, atol=1e-4)

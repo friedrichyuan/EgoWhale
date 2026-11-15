@@ -75,9 +75,11 @@ def test_missing_input_excluded_and_next_episode_runs(tmp_path):
 
 def test_weighted_aggregate_and_zero_measurements():
     rows = [dict(status="ok", frames=10, node_s=1, warmup=True),
-            dict(status="ok", frames=40, node_s=4, warmup=False),dict(status="failed")]
+            dict(status="ok", frames=40, node_s=4, warmup=False),
+            dict(status="failed"), dict(status="rejected")]
     s = summarize(rows, 2, 10)
     assert s["overall_fps"] == 5
+    assert (s["ok"], s["failed"], s["rejected"]) == (2, 1, 1)
     assert s["all_successful"]["node_fps"] == 10
     assert s["after_warmup"]["node_fps"] == 10
     assert s["after_warmup"]["compute_fps"] is None

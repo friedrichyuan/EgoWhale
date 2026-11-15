@@ -39,7 +39,7 @@ class EpisodeStream:
             try:
                 self.active[token] = self.backend.prepare(data)
             except Exception as exc:
-                completed.append(dict(token=token, ok=False, error=str(exc)))
+                completed.append(dict(token=token, ok=False, error=str(exc), no_base=isinstance(exc, core.NoBaseCandidate)))
         for _ in range(steps):
             if not self.active:
                 break
@@ -98,6 +98,7 @@ def compute_batch(robot, items, batch_size):
 
 def main():
     import argparse
+    import json
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -107,20 +108,35 @@ def main():
         "--inputs", type=Path, nargs="+", required=True, help="episode output directories containing action/gripper.npz"
     )
     parser.add_argument("--out", type=Path, required=True, help="new output root, grouped by task/episode")
+    parser.add_argument("--episodes", type=Path, help="Source HDF5 list for the camera geometry checks")
     args = parser.parse_args()
     robot = load_robot(args.robot)
     episode_capacity(robot, args.batch_size)
     keys = [Path(p.parent.name) / p.name for p in args.inputs]
     if len(set(keys)) != len(keys):
         parser.error("duplicate task/episode names")
+    sources = {}
+    if args.episodes:
+        paths = [Path(line.strip()) for line in args.episodes.read_text().splitlines() if line.strip()]
+        sources = {Path(path.parent.name) / path.stem: path for path in paths}
+        if len(sources) != len(paths) or not set(keys) <= sources.keys():
+            parser.error("--episodes must uniquely identify every input episode")
     args.out.mkdir(parents=True, exist_ok=False)
 
     def inputs():
         for index, path in enumerate(args.inputs):
-            yield index, core.read_gripper(path)
+            data = core.read_gripper(path)
+            if sources:
+                data["camera_size"] = core.camera_size(sources[keys[index]])
+            yield index, data
 
     for row in iter_results(robot, inputs(), args.batch_size):
         if not row["ok"]:
+            if row.get("no_base"):
+                with (args.out / "rejected.jsonl").open("a") as handle:
+                    handle.write(json.dumps({"input": str(args.inputs[row["token"]]), "reason": row["error"]}) + "\n")
+                print(f"rejected {args.inputs[row['token']]}: {row['error']}", flush=True)
+                continue
             raise RuntimeError(f"{args.inputs[row['token']]}: {row['error']}")
         src, key, result = args.inputs[row["token"]], keys[row["token"]], row["out"]
         dst = args.out / key

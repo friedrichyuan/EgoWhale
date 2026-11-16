@@ -61,7 +61,7 @@ The final video is saved to `outputs/demo/visual/composite.mp4`, with the qualit
 > 1. The full pipeline uses **EgoDex HDF5 + a same-name MP4** with matching frame counts and targets **ARX ACone**. 
 > 2. Enable **DynHaMR temporal refinement** on Path B with `dynhamr_enabled: true` in the [hand config](egowhale/wilor/cfgs/wilor_hand_pipeline.yaml). It can improve smoothness and temporal consistency, is **off by default**, and requires additional dependencies and computation.
 > 3. **STTN** is the default inpainter. After installing **ProPainter** and its weights, switch with `--inpaint-model propainter`, or set `nodes.inpaint.model: propainter` in a batch config.
-> 4. **VLM auditing is optional.** In single-episode runs, set `EGOWHALE_VLM_API_KEY` to let Curate audit eligible episodes using Qwen by default. Without a key, the audit is marked `skipped`; API failures are recorded as `error` and do not by themselves fail the episode. **Ray batch runs disable this audit.** See [VLM configuration](docs/usage.md#optional-vlm-audit).
+> 4. **VLM auditing is optional.** In single-episode runs, set `EGOWHALE_VLM_API_KEY` to let Curate audit eligible episodes using Qwen by default. Without a key, the audit is marked `skipped`; API failures are recorded as `error` and do not by themselves fail the episode. **Ray batch runs disable this audit.
 
 
 ## Run One Stage
@@ -97,7 +97,7 @@ bash scripts/batch.sh cfgs/bench8_sttn.yaml \
   --out outputs
 ```
 
-`--episodes` accepts HDF5 files, dataset directories, or `.txt` lists of episode paths. Results go to `outputs/my_run/`, with `batch.jsonl` episode records and TensorBoard events in `tb/`. Configure GPU pools, shared action actors, IO queues, and memory limits in YAML; see the [batch guide](docs/usage.md#run-a-corpus).
+`--episodes` accepts HDF5 files, dataset directories, or `.txt` lists of episode paths. Results go to `outputs/my_run/`, with `batch.jsonl` episode records and TensorBoard events in `tb/`. Configure GPU pools, shared action actors, IO queues, and memory limits in YAML.
 
 The supplied preset targets **8 GPUs and a high-memory host**; adapt it to your machine. `--limit 1` limits the episode count while keeping the configured resources. 
 

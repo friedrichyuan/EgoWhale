@@ -97,7 +97,7 @@ bash scripts/batch.sh cfgs/bench8_sttn.yaml \
   --out outputs
 ```
 
-`--episodes` accepts HDF5 files, dataset directories, or `.txt` lists of episode paths. Results go to `outputs/my_run/`, with `batch.jsonl` episode records and TensorBoard events in `tb/`. Configure GPU pools, shared action actors, IO queues, and memory limits in YAML.
+`--episodes` accepts HDF5 files, dataset directories, or `.txt` lists of episode paths. Results go to `outputs/my_run/`, with `batch.jsonl` episode records and TensorBoard events in `tb/`. Configure GPU pools, shared action actors, IO queues, and memory limits in [YAML](cfgs/bench8_sttn.yaml).
 
 The supplied preset targets **8 GPUs and a high-memory host**; adapt it to your machine. `--limit 1` limits the episode count while keeping the configured resources. 
 

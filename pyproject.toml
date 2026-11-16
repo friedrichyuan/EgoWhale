@@ -34,3 +34,4 @@ known-first-party = ["egowhale"]
 
 [tool.setuptools.package-data]
 "egowhale.wilor" = ["cfgs/*.yaml", "scripts/*.sh"]
+"egowhale.wilor.ego2robot_sync" = ["configs/*.yaml", "scripts/*.py"]

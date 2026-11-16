@@ -1,0 +1,47 @@
+# Hand-only experiment: SAM3 + AnyHand/WiLoR + tracking + DynHaMR/HMP.
+# Run via scripts/run_hand_experiment.py, which resolves these paths.
+mode: [hand]
+hand_backend: anyhand
+anyhand_backend: wilor
+anyhand_root: thirdparty/AnyHand
+dynhamr_enabled: false
+dynhamr_required: false
+hand_mode: full
+dynhamr_root: thirdparty/Dyn-HaMR
+# Empty means the same Python interpreter that launches this experiment.
+dynhamr_python: ""
+dynhamr_timeout: 7200
+dynhamr_gpu: 0
+dynhamr_z_min: 0.15
+dynhamr_z_max: 0.4
+dynhamr_gap_fill: 3
+anyhand_focal: 2500
+hand_det_thresh: 0.3
+hand_overlay_points_only: true
+sam3_checkpoint: thirdparty/sam3/checkpoints/sam3.pt
+depth_model: da3giant
+da3_model_root: thirdparty/da3/weights
+da3_process_res: 504
+depth_stride: 1
+known_intrinsics: false
+input_resolution: 480
+output_resolution: 480
+output_resize: true
+debug: false
+verbose: true
+skip_existing: true
+n_processes: 1
+robot: Panda
+gripper: Robotiq85
+square: false
+epic: false
+bimanual_setup: shoulders
+target_hand: both
+constrained_hand: true
+depth_for_overlay: false
+render: false
+camera_intrinsics: ""
+camera_extrinsics: ""
+data_root_dir: .
+processed_data_root_dir: .
+demo_name: ""

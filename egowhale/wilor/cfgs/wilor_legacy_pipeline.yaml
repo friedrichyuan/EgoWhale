@@ -1,0 +1,36 @@
+# Full hand pipeline using pinned author masks/filter/tracking/jump methods.
+# Independent of the global batch configuration. Use a new output directory.
+# Known K: source=provided with a sized JSON, or source=egodex with explicit HDF5.
+camera:
+  source: da3
+  process_res: 336
+  # Validated short-video profile on this server; library defaults remain 16/8.
+  window: 128
+  overlap: 8
+mask:
+  enabled: true
+  backend: author-video
+  edge: true
+tracking:
+  enabled: true
+  method: author
+jump:
+  enabled: true
+  method: author
+refine:
+  enabled: true
+  run_prior: true
+  boundary_trim: 3
+  camera_mode: author-static
+  opt_scale: false
+  root_iters: 50
+  smooth_iters: 300
+  lbfgs_max_iter: 20
+depth_bounds:
+  enabled: true
+  min: 0.05
+  max: 0.4
+gaps:
+  enabled: true
+publish:
+  stage: final

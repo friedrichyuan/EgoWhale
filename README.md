@@ -42,6 +42,14 @@ python -m egowhale path/to/episode.hdf5 [out_dir] [--steps NAME ...] [--inpaint-
 
 When `out_dir` is omitted, files are written to `outputs/<parent>/<stem>/`. `--steps` runs only the named stages.
 
+The independent WiLoR hand experiment (`scripts/run_wilor_video.sh`, default `full` mode) attempts DynHaMR root/smooth and HMP refinement. If HMP fails or its worker exits during that stage, it continues exporting `prediction.mp4` from the existing filtered WiLoR tracks. The hand metadata and `SUCCESS.json` record `optimizer_fallback`, `prior_executed: false`, and the fallback reason. Camera, detection, and root/smooth failures still stop the task. HMP resource checks are optional so missing prior weights can follow this fallback path.
+
+The `WiLoR` node uses the synchronized Ego2Robot hand implementation in `egowhale/wilor/ego2robot_sync`, configured by `egowhale/wilor/cfgs/wilor_hand_pipeline.yaml`. MP4 input uses Path B with DA3 camera estimation and AnyHand/WiLoR hand prediction; HDF5 input uses Path A hand annotations and its sibling MP4. DynHaMR is disabled by default. Set `dynhamr_enabled: true` to enable reference optimization and its fallback on Path B. The 480-high overlay and reference output live in `action/wilor_ego2robot/`, while `action/hands_wilor.npz` exposes EgoWhale's wrist/thumb/index/middle/ring/little coordinate order. This node defaults to `EgoWhale/thirdparty` and the shared `../.conda-egohand` environment; override `EGOWHALE_WILOR_THIRDPARTY` for a different installation.
+
+For a standalone test, use `bash scripts/wilor.sh <video.mp4|episode.hdf5> [output_dir]`; edit its `GPU_ID` or set it in the environment. HDF5 input requires a same-name MP4. Alternatively edit `scripts/run_wilor_ego2robot.sh`. The older `scripts/run_wilor_video.sh`, `scripts/run_wilor_batch.sh`, and `egowhale.wilor.pipeline` are retained as a legacy experimental implementation and do not run this synchronized node.
+
+For an MP4 directory, edit `GPU_IDS`, `INPUT_DIR`, and `OUTPUT_DIR` in `scripts/run_wilor_ego2robot_batch.sh`, then run it. The default processes all `add_remove_lid` videos with Path B and DA3, one video per GPU at a time. `MAX_VIDEOS=1` tests one clip; `--dry-run` lists the plan. Results are gathered in the batch's `final_videos/`; `results.csv` reports visible frames and failures, and each video directory contains a `process.log` and the EgoWhale hand output.
+
 Model weights stay local:
 
 | Model | Path |

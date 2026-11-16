@@ -45,7 +45,7 @@ def pack_detections(frames: list, intrinsic: np.ndarray, fps: float) -> dict:
             'frame_index': np.arange(count), 'timestamps': np.arange(count) / fps, 'fps': np.float32(fps)}
 
 
-def validate_legacy_prediction(result, count) -> None:
+def validate_legacy_prediction(result, count, *, require_positive_depth=True) -> None:
     if not isinstance(count, int) or count < 1:
         raise ValueError('WiLoR output invalid frame count')
     shapes = {'joints_camera': (count, 2, 21, 3), 'keypoints_2d': (count, 2, 21, 2),
@@ -63,7 +63,7 @@ def validate_legacy_prediction(result, count) -> None:
     if not np.allclose(result['timestamps'], np.arange(count) / fps):
         raise ValueError('WiLoR output timestamps mismatch')
     points = result['joints_camera'][result['valid']]
-    if not np.isfinite(points).all() or np.any(points[..., 2] <= 0):
+    if not np.isfinite(points).all() or (require_positive_depth and np.any(points[..., 2] <= 0)):
         raise ValueError('WiLoR output invalid visible joints')
 
 
@@ -77,10 +77,13 @@ def validate_prediction_input(src: Path, dst: Path, options: dict | None = None)
     with np.load(Path(dst) / HANDS_WILOR) as result:
         if str(result['signature']) != meta['signature']:
             raise ValueError('WiLoR NPZ/metadata mismatch')
-        validate_legacy_prediction(result, meta.get('frames'))
+        validate_legacy_prediction(result, meta.get('frames'), require_positive_depth=meta.get('source') != 'ego2robot_sync')
     marked = meta.get('calibration_input')
     if marked is not None and file_identity(Path(marked['path'])) != marked:
         raise ValueError('WiLoR calibration input changed; use a new output directory')
+    marked_json = meta.get('intrinsics_json_input')
+    if marked_json is not None and file_identity(Path(marked_json['path'])) != marked_json:
+        raise ValueError('WiLoR JSON intrinsics changed; use a new output directory')
     for key, value in (options or {}).items():
         if key not in ('camera_mode', 'calibration', 'confidence'):
             continue
@@ -182,39 +185,25 @@ class WiLoR(Step):
     makes = (HANDS_WILOR, HANDS_WILOR_META)
     gpus = 1
 
-    def __init__(self, camera_mode='wilor-default', calibration=None, python=None, confidence=.3, timeout=1800, pipeline_config: str | Path | None = None):
+    def __init__(self, camera_mode='wilor-default', calibration=None, python=None, confidence=.3, timeout=1800, pipeline_config: str | Path | None = None, intrinsics_json=None):
         super().__init__()
+        from egowhale.wilor.synced import CONFIG, DEFAULT_PYTHON
         self.options = {'camera_mode': camera_mode, 'calibration': str(Path(calibration).resolve()) if calibration else None,
                         'confidence': confidence}
-        self.python = Path(python) if python else THIRDPARTY / 'WiLoR/.venv/bin/python'
+        self.python = Path(python) if python else DEFAULT_PYTHON
+        self.intrinsics_json = str(Path(intrinsics_json).resolve()) if intrinsics_json else None
         self.timeout = timeout
         self.client = None
-        self.pipeline_config = Path(pipeline_config).absolute() if pipeline_config else None
-        if self.pipeline_config and (camera_mode != 'wilor-default' or calibration is not None or python is not None or confidence != .3):
-            raise ValueError('legacy WiLoR options conflict with pipeline_config; put options in its YAML')
+        self.pipeline_config = Path(pipeline_config).absolute() if pipeline_config else CONFIG
         if not 0 < confidence < 1 or timeout <= 0:
             raise ValueError('confidence must be in (0,1) and timeout must be positive')
 
     def signature(self, src: Path) -> str:
-        model = THIRDPARTY / 'WiLoR'
-        files = [video_path(src), model / 'pretrained_models/wilor_final.ckpt',
-                 model / 'pretrained_models/detector.pt', model / 'pretrained_models/model_config.yaml',
-                 model / 'mano_data/mano/MANO_RIGHT.pkl']
-        # The official installation may keep MANO directly in mano_data.
-        if not files[-1].is_file():
-            files[-1] = model / 'mano_data/MANO_RIGHT.pkl'
-        if self.options['calibration']:
-            files.append(Path(self.options['calibration']))
-        payload = {'schema': 2, 'options': self.options, 'files': [file_identity(p) for p in files]}
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        from egowhale.wilor.synced import signature
+        return signature(src, self.pipeline_config, self.options['calibration'],
+                         self.options['camera_mode'], self.options['confidence'], self.intrinsics_json)
 
     def validate_outputs(self, src, dst):
-        if self.pipeline_config is not None:
-            if (Path(dst) / HANDS_WILOR).exists() or (Path(dst) / HANDS_WILOR_META).exists():
-                from egowhale.wilor.pipeline.runner import validate_pipeline_models
-                meta = validate_prediction_input(src, dst, {'pipeline_config': str(self.pipeline_config)})
-                validate_pipeline_models(meta)
-            return
         path, meta = Path(dst) / HANDS_WILOR, Path(dst) / HANDS_WILOR_META
         if not path.exists() and not meta.exists():
             return
@@ -226,30 +215,19 @@ class WiLoR(Step):
         with np.load(path) as result:
             if str(result['signature']) != marked['signature']:
                 raise ValueError('WiLoR NPZ/metadata mismatch')
-            validate_legacy_prediction(result, marked.get('frames'))
+            validate_legacy_prediction(result, marked.get('frames'), require_positive_depth=marked.get('source') != 'ego2robot_sync')
 
     def load(self):
-        if self.client is None:
-            if not self.python.is_file():
-                raise FileNotFoundError(f'WiLoR Python not found: {self.python}')
-            self.client = WorkerClient([str(self.python.absolute()), str(ROOT / 'egowhale/wilor/worker.py')],
-                                       THIRDPARTY / 'WiLoR', self.timeout)
+        if not self.python.is_file():
+            raise FileNotFoundError(f'WiLoR Python not found: {self.python}')
 
     def run(self, src: Path, dst: Path):
-        if self.pipeline_config is not None:
-            from egowhale.wilor.pipeline.runner import load_options, run_pipeline
-            run_pipeline(src, dst, load_options(self.pipeline_config))
-            return
         self.validate_outputs(src, dst)
         if (Path(dst) / HANDS_WILOR_META).is_file():
             return
-        signature = self.signature(src)
-        self.load()
-        out = Path(dst).resolve()
-        out.mkdir(parents=True, exist_ok=True)
-        self.client.request({'video': str(video_path(src).resolve()), 'out': str(out),
-                             'signature': signature, 'input': file_identity(video_path(src)),
-                             'calibration_input': file_identity(Path(self.options['calibration'])) if self.options['calibration'] else None, **self.options})
+        from egowhale.wilor.synced import run
+        run(src, dst, self.pipeline_config, self.python, self.options['camera_mode'],
+            self.options['calibration'], self.options['confidence'], self.intrinsics_json)
         self.validate_outputs(src, dst)
 
     def release(self):

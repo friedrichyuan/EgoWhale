@@ -11,7 +11,7 @@ from egowhale.robots import load_robot
 from egowhale.robots.motion import read_bases, read_motion
 
 
-@pytest.mark.parametrize("name,count", [("arx", 1), ("piper", 2)])
+@pytest.mark.parametrize("name,count", [("arx", 1), ("piper", 2), ("franka", 2), ("ur5e", 2)])
 def test_assets_and_named_motion(name, count):
     robot = load_robot(name)
     assert len(robot.groups) == count
@@ -51,11 +51,13 @@ def test_arx_matches_legacy_pack_and_seed():
     np.testing.assert_array_equal(base_ik._offset_grid(robot.groups[0].bounds), golden["grid"])
 
 
-def test_piper_urdf_matches_mjcf_fk():
-    robot = load_robot("piper")
+@pytest.mark.parametrize("name", ["piper", "franka", "ur5e"])
+def test_twin_urdf_matches_mjcf_fk(name):
+    robot = load_robot(name)
     model = robot.model
     data = mujoco.MjData(model)
     rng = np.random.default_rng(12)
+    robot.place_bases(model, {g.name: np.eye(4) for g in robot.groups})
     for group in robot.groups:
         tree = ET.fromstring(robot._urdf(group.name))
         for _ in range(12):
@@ -78,11 +80,16 @@ def test_piper_urdf_matches_mjcf_fk():
             np.testing.assert_allclose(got[:3, 3], data.site(group.tools[0]).xpos, atol=1e-9)
             np.testing.assert_allclose(got[:3, :3], data.site(group.tools[0]).xmat.reshape(3, 3), atol=1e-9)
     fingers = robot.gripper_positions(np.full((2, 2), .04), np.ones((2, 2), dtype=bool))
-    np.testing.assert_array_equal(fingers["left_joint7"], -fingers["left_joint8"])
+    assert set(fingers) == set(robot.joint_names) - {n for g in robot.groups for n in g.joints}
+    for joint, values in fingers.items():
+        lower, upper = model.joint(joint).range
+        assert ((values >= lower) & (values <= upper)).all()
+    if name == "piper":
+        np.testing.assert_array_equal(fingers["left_joint7"], -fingers["left_joint8"])
 
 
 @pytest.mark.parametrize("fps", [18.0, 30.0])
-@pytest.mark.parametrize("name", ["arx", "piper"])
+@pytest.mark.parametrize("name", ["arx", "piper", "franka", "ur5e"])
 def test_node_io_and_group_dispatch_without_gpu(tmp_path, monkeypatch, name, fps):
     calls = []
     def solve(position, rotation, valid, group, fps, periodic=None):
@@ -118,7 +125,7 @@ def test_node_io_and_group_dispatch_without_gpu(tmp_path, monkeypatch, name, fps
     assert len(prefix["joint_positions"]) == (10 if name == "arx" else 16)
 
 
-@pytest.mark.parametrize("name", ["arx", "piper"])
+@pytest.mark.parametrize("name", ["arx", "piper", "franka", "ur5e"])
 @pytest.mark.parametrize("with_prefix", [True, False])
 @pytest.mark.parametrize("split", [True, False])
 @pytest.mark.parametrize("fps", [18.0, 30.0])

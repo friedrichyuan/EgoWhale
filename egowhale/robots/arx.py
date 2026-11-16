@@ -9,6 +9,11 @@ from egowhale.paths import ASSETS
 
 from .base import Robot, SolveGroup
 
+ASSET = ASSETS / "robots/arx"
+SCENE = ASSET / "mjcf/scene.xml"
+URDF = ASSET / "curobo/arx_acone_kin.urdf"
+YAML = ASSET / "curobo/arx_acone.yml"
+
 ARM = tuple([f"left_joint{i}" for i in range(1, 7)] + [f"right_joint{i}" for i in range(11, 17)])
 GRIPPERS = (("left_joint7", "left_joint8"), ("right_joint17", "right_joint18"))
 
@@ -19,11 +24,11 @@ class ARXRobot(Robot):
     tcp_sites = ("left_tcp", "right_tcp")
 
     def scene_spec(self):
-        return mujoco.MjSpec.from_file(str(ASSETS / "mujoco_arx_scene/scene.xml"))
+        return mujoco.MjSpec.from_file(str(SCENE))
 
     @cached_property
     def groups(self):
-        path = ASSETS / "curobo_arx/arx_acone.yml"
+        path = YAML
         config = yaml.safe_load(path.read_text())
         kin = config["robot_cfg"]["kinematics"]
         kin["urdf_path"] = str((path.parent / kin["urdf_path"]).resolve())

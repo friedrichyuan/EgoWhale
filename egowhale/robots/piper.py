@@ -17,7 +17,7 @@ from egowhale.paths import ASSETS
 
 from .base import Robot, SolveGroup
 
-SOURCE = ASSETS / "piper_sources/menagerie/agilex_piper/piper.xml"
+SOURCE = ASSETS / "robots/piper/mjcf/piper.xml"
 # Centers of the distal inner finger pads in the downloaded model's body frames.
 PADS = (("link7", (0., -.045, 0.)), ("link8", (0., .045, 0.)))
 BOUNDS = np.array([.30, .30, .20, np.deg2rad(35.)])

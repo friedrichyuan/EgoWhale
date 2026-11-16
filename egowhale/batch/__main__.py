@@ -11,6 +11,7 @@ from egowhale.batch.report import watched
 from egowhale.batch.resources import pools_from
 from egowhale.batch.scheduler import serve
 from egowhale.config import ConfigError
+from egowhale.robots import ROBOT_NAMES
 
 
 def main() -> None:
@@ -20,7 +21,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="run only the first N episodes")
     parser.add_argument("--episodes", nargs="+", help="replace the config's episodes: .txt lists, HDF5 files, or dataset directories")
     parser.add_argument("--out", help="replace the config's output root; results go to <out>/<name>/")
-    parser.add_argument("--robot", choices=("arx", "piper", "dual_piper"))
+    parser.add_argument("--robot", choices=ROBOT_NAMES)
     parser.add_argument("--no-approach", action="store_const", const=False, default=None, dest="approach", help="do not generate an approach prefix")
     args = parser.parse_args()
     try:

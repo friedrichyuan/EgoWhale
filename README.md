@@ -52,7 +52,24 @@ Model weights stay local:
 | ProPainter (optional inpainter) | `thirdparty/propainter` |
 | Depth Anything 3 (DA3-GIANT) | `thirdparty/da3` |
 
-The robot assets go in `assets/curobo_arx/` (cuRobo URDF and YAML) and `assets/mujoco_arx_scene/` (MuJoCo scene).
+Robot adapters read their assets under `assets/robots/`. Pass `--robot arx|piper|franka|ur5e` to the single-episode, batch, or node benchmark CLI. Use a fresh output directory when changing robot, since the action and render output names are shared.
+
+| Robot | Base/IK groups | Runtime assets |
+| --- | --- | --- |
+| `arx` | One shared base with two TCPs | `arx/mjcf/scene.xml` and `arx/curobo/arx_acone.yml` with its URDF |
+| `piper` | Two independent 6-DoF arms | `piper/mjcf/piper.xml` and its meshes |
+| `franka` | Two independent 7-DoF Panda arms | `franka/mjcf/panda.xml` and its meshes |
+| `ur5e` | Two independent 6-DoF arms with Robotiq 2F-85 | `ur5e/mjcf/ur5e.xml`, meshes, and `ur5e/robotiq_2f85_calibration.json` |
+
+Assets stay outside Git. On a new server, prepare this layout with
+`python tools/install_robot_assets.py /path/to/ego2robot_blog` after checking out the
+[referenced upstream revision](https://github.com/www-Ye/ego2robot_blog/tree/244a4ee02f02b2e93e94a81f27963597e0815ce6).
+The helper copies your existing ACone scene and URDF from their legacy paths. It uses your local PiPer model
+when available and falls back to Ego2Robot otherwise. It installs Panda, UR5e and the Robotiq calibration
+from Ego2Robot and preserves the model licenses.
+Ego2Robot's bundled ARX L5 is a separate single-arm asset. EgoWhale uses the calibrated ACone
+scene for `arx`. For the independent arms, the adapters derive the cuRobo kinematics from their
+MuJoCo arm transforms so that IK and render use the same joint axes and TCP.
 
 Inpaint uses STTN by default. ProPainter is sharper but about ten times slower; select it with
 `--inpaint-model propainter`, or `nodes.inpaint.model: propainter` in a batch config.

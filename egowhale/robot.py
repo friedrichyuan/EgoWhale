@@ -6,14 +6,13 @@ from pathlib import Path
 
 import yaml
 
-from egowhale.paths import ASSETS
 from egowhale.robots.arx import ARM as ARM
 from egowhale.robots.arx import GRIPPERS as GRIPPERS
+from egowhale.robots.arx import SCENE as SCENE
+from egowhale.robots.arx import URDF as URDF
+from egowhale.robots.arx import YAML as YAML
 from egowhale.robots.arx import ARXRobot
 
-SCENE = ASSETS / "mujoco_arx_scene/scene.xml"
-URDF = ASSETS / "curobo_arx/arx_acone_kin.urdf"
-YAML = ASSETS / "curobo_arx/arx_acone.yml"
 TCP = ARXRobot.tcp_sites
 CAMERA = ARXRobot.camera
 

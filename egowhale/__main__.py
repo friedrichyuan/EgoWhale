@@ -11,6 +11,7 @@ from egowhale.action.retarget import Retarget
 from egowhale.config import ConfigError, ik_options, read_config
 from egowhale.paths import default_out
 from egowhale.quality.curate import Curate
+from egowhale.robots import ROBOT_NAMES
 from egowhale.robots.factory import make_step
 from egowhale.step import run
 from egowhale.visual.composite import Composite
@@ -29,7 +30,7 @@ def main() -> None:
     parser.add_argument("out", type=Path, nargs="?", help="output directory; default outputs/<task>/<episode>")
     parser.add_argument("--steps", nargs="+", choices=names, metavar="NAME", help=f"run only these, in pipeline order: {' '.join(names)}")
     parser.add_argument("--inpaint-model", choices=MODELS, default=DEFAULT_MODEL)
-    parser.add_argument("--robot", choices=("arx", "piper", "dual_piper"))
+    parser.add_argument("--robot", choices=ROBOT_NAMES)
     parser.add_argument("--config", type=Path, help="YAML for robot and Base IK settings")
     parser.add_argument("--no-approach", action="store_true", help="do not generate an approach prefix")
     args = parser.parse_args()

@@ -17,6 +17,7 @@ from queue import Empty
 from egowhale.config import DEFAULTS, ConfigError, episodes, ik_options, read_config
 from egowhale.paths import IK, PREFIX
 from egowhale.pieces import located, missing, pieces, plan
+from egowhale.robots import ROBOT_NAMES
 
 
 def prepare(src, dst, inputs, step, piece_frames):
@@ -375,7 +376,7 @@ def main():
     parser.add_argument("--episodes", nargs="+", help="HDF5 files, directories, or text lists")
     parser.add_argument("--out", type=Path, help="fresh output root; episodes stored under task/name")
     parser.add_argument("--inputs-root", type=Path, nargs="+", help="upstream roots with identical task/name and piece layout")
-    parser.add_argument("--robot", choices=("arx", "piper", "dual_piper"))
+    parser.add_argument("--robot", choices=ROBOT_NAMES)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--warmup", type=int, help="successful episodes per worker excluded from after_warmup metrics")
     parser.add_argument("--workers", type=int, help="persistent processes; default one per visible GPU, or one for composite")
@@ -402,8 +403,8 @@ def main():
         args.ik_method, args.batch_size, args.episode_capacity = (
             ik_options(cfg["nodes"]["action"], args.robot) if args.stage == "base_ik" else ("base_ik", 0, 0)
         )
-        if args.robot not in ("arx", "piper", "dual_piper"):
-            raise ConfigError("robot must be arx, piper or dual_piper")
+        if args.robot not in ROBOT_NAMES:
+            raise ConfigError(f"robot must be one of {', '.join(ROBOT_NAMES)}")
         if args.inpaint_model not in ("sttn", "propainter"):
             raise ConfigError("inpaint model must be sttn or propainter")
         if any(type(value) is not int for value in (args.limit, args.warmup, args.piece_frames, args.window)):

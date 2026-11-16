@@ -1,7 +1,7 @@
 """Transport-independent streaming episode IK; finished episodes release their slots."""
 
 from egowhale.action import base_ik as core
-from egowhale.robots import load_robot
+from egowhale.robots import ROBOT_NAMES, load_robot
 
 # Frames per actor RPC; stop sooner whenever an episode completes. Not a wait timeout.
 FRAME_QUANTUM = 8
@@ -102,7 +102,7 @@ def main():
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--robot", default="piper", choices=("arx", "piper", "dual_piper"))
+    parser.add_argument("--robot", default="piper", choices=ROBOT_NAMES)
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument(
         "--inputs", type=Path, nargs="+", required=True, help="episode output directories containing action/gripper.npz"

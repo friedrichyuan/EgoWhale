@@ -12,6 +12,7 @@ import yaml
 
 from egowhale.paths import ROOT
 from egowhale.pieces import PIECE
+from egowhale.robots import ROBOT_NAMES
 
 
 class ConfigError(ValueError):
@@ -107,8 +108,8 @@ def load(path: Path | str, **overrides) -> dict:
             config[key] = value
     if type(config["approach"]) is not bool:
         raise ConfigError("approach must be true or false")
-    if config["robot"] not in ("arx", "piper", "dual_piper"):
-        raise ConfigError("robot must be arx or piper")
+    if config["robot"] not in ROBOT_NAMES:
+        raise ConfigError(f"robot must be one of {', '.join(ROBOT_NAMES)}")
     if not config["episodes"]:
         raise ConfigError(f"{path}: no episodes")
     slots = config["io"]["write_slots_per_lane"]

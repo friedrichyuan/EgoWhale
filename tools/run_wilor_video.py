@@ -34,7 +34,7 @@ def resolve(value):
 def settings(mode, da3_python, wilor_python, samples, batch, sam3_python=None, dynhamr_python=None):
     if samples < 1 or batch < 1:
         raise ValueError('DA3_SAMPLES and BATCH_SIZE must be positive')
-    given = yaml.safe_load((ROOT / 'egowhale/wilor/cfgs/wilor_hand_pipeline.yaml').read_text()) if mode == 'full' else {}
+    given = yaml.safe_load((ROOT / 'egowhale/wilor/cfgs/wilor_legacy_pipeline.yaml').read_text()) if mode == 'full' else {}
     # Unknown intrinsics are an enforced input contract, not an optional calibration mode.
     given['camera'] = {**given.get('camera', {}), 'source': 'da3', 'calibration': None,
                        'poses': None, 'motion': False, 'python': str(resolve(da3_python)), 'samples': samples}
@@ -66,7 +66,7 @@ def preflight(options):
     if failures:
         raise RuntimeError('Resources are not ready:\n  ' + '\n  '.join(failures)
                            + '\n软件环境检查：conda activate egowhale-wilor; python tools/check_wilor_env.py'
-                           + '\n完整模式需要 SAM3 权重、BMC 和 HMP 资源；不会回退到 raw。'
+                           + '\n相机、WiLoR、SAM3 和 DynHaMR 依赖仍需齐全；HMP 失败时会回退已有手部预测。'
                            + '\n请检查模型资源路径及 Python 依赖。')
     for section, code in [('camera', "from depth_anything_3.api import DepthAnything3"),
                           ('wilor', 'import ultralytics, smplx, pytorch_lightning')]:
@@ -170,7 +170,7 @@ def export_ground_truth(video, annotation, target):
 
 
 def validate_full_prediction(artifact):
-    """Never label skipped optimization or raw/smooth output as a full result."""
+    """Accept completed optimization or an explicitly recorded HMP fallback."""
     meta = artifact.meta
     if meta.get('published_stage') != 'final':
         raise ValueError('完整模式必须发布 final 结果，不能使用逐帧 raw 结果')
@@ -178,7 +178,10 @@ def validate_full_prediction(artifact):
     for key in ('mask', 'tracking', 'jump', 'refine', 'depth_bounds', 'gaps'):
         if not options.get(key, {}).get('enabled'):
             raise ValueError(f'完整模式缺少已启用的阶段：{key}')
-    if (not meta.get('optimizer_executed') or not meta.get('prior_executed')
+    fallback = (meta.get('optimizer_fallback') and meta.get('fallback_stage') == 'hmp'
+                and bool(meta.get('fallback_reason')) and not meta.get('prior_executed')
+                and meta.get('optimizer_stage') == 'filtered')
+    if not fallback and (not meta.get('optimizer_executed') or not meta.get('prior_executed')
             or meta.get('optimizer_stage') != 'prior'):
         raise ValueError('DynHaMR/HMP 未实际完成，不能导出为完整流程结果；请检查检测是否为空及优化器日志')
     if meta.get('boundary_trim') != 3:
@@ -198,15 +201,22 @@ def execute(video, output, options, mode, annotation):
             run_pipeline(video, output, options, stages=(key,))
     with stage(len(stages) + 2, total, '导出预测点视频（不连线）'):
         if mode == 'full':
-            validate_full_prediction(read_artifact(output / HANDS_WILOR, expected_kind='prediction'))
+            prediction = read_artifact(output / HANDS_WILOR, expected_kind='prediction')
+            validate_full_prediction(prediction)
+            if prediction.meta.get('optimizer_fallback'):
+                print('HMP 未完成，继续导出 WiLoR 回退结果：' + prediction.meta['fallback_reason'], flush=True)
         export_prediction(video, output / HANDS_WILOR, output / 'prediction.mp4')
     if annotation is not None:
         with stage(total, total, '导出 EgoDex 标注点视频（仅此阶段读取标注）'):
             export_ground_truth(video, annotation, output / 'egodex_gt.mp4')
     else:
         print('未提供 EgoDex 标注：不生成 egodex_gt.mp4。推理不受影响。', flush=True)
+    prediction_meta = json.loads((output / HANDS_WILOR).with_suffix('.json').read_text())
     (output / 'SUCCESS.json').write_text(json.dumps({'video': str(video), 'mode': mode,
         'camera_source': 'da3', 'inference_calibration': None, 'annotation_used_only_after_inference': str(annotation) if annotation else None,
+        'optimizer_fallback': bool(prediction_meta.get('optimizer_fallback')),
+        'prior_executed': bool(prediction_meta.get('prior_executed')),
+        'fallback_reason': prediction_meta.get('fallback_reason'),
         'completed_at': datetime.now().astimezone().isoformat()}, indent=2) + '\n')
     print(f'全部完成：{output}', flush=True)
 

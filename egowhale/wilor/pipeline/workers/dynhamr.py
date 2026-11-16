@@ -63,6 +63,20 @@ def install_camera_reader():
     CameraData.load_data = exact_camera
 
 
+def attempt_prior(callback, workspace, *args):
+    """A failed HMP stage may publish the existing filtered WiLoR prediction."""
+    try:
+        callback(*args)
+    except Exception as error:
+        response = {'ok': True, 'optimizer_fallback': True, 'fallback_stage': 'hmp',
+                    'fallback_reason': f'{type(error).__name__}: {error}',
+                    'root_smooth_completed': True, 'prior_executed': False}
+        (Path(workspace) / 'hmp_fallback.json').write_text(json.dumps(response, ensure_ascii=False, indent=2))
+        print('[回退] HMP 失败，继续导出 WiLoR 结果：' + response['fallback_reason'], file=sys.stderr, flush=True)
+        return response
+    return None
+
+
 def optimize(request):
     import os
     import runpy
@@ -165,7 +179,10 @@ def optimize(request):
     device = torch.device('cuda:0')
     upstream['run_opt'](root_cfg, dataset, str(output), device)
     if cfg.run_prior:
-        run_prior(cfg, dataset, output, device, upstream, o, images)
+        (work / 'optimizer_stage.json').write_text(json.dumps({'stage': 'hmp'}))
+        fallback = attempt_prior(run_prior, work, cfg, dataset, output, device, upstream, o, images)
+        if fallback:
+            return fallback
     result_path = select_result(output, cfg.run_prior)
     tracks = read_artifact(work / 'tracks.npz', expected_kind=json.loads((work / 'tracks.json').read_text())['kind'])
     out = derive(tracks, 'refined', optimizer_executed=True, optimizer_result=str(result_path),

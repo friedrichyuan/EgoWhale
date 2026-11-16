@@ -113,9 +113,24 @@ def refine_tracks(tracks: Artifact, camera: Artifact, video: Path, options: dict
     write_artifact(workspace / 'camera.npz', camera)
     client = WorkerClient([str(Path(options['python']).absolute()), str(Path(__file__).parent / 'workers/dynhamr.py')],
                           Path(options['repo']) / 'dyn-hamr', options['timeout'])
+    stage_path = workspace / 'optimizer_stage.json'
+    stage_path.unlink(missing_ok=True)
     try:
-        response = client.request({'operation': 'refine', 'video': str(Path(video).resolve()), 'workspace': str(workspace.resolve()),
-                                   'options': options})
+        try:
+            response = client.request({'operation': 'refine', 'video': str(Path(video).resolve()), 'workspace': str(workspace.resolve()),
+                                       'options': options})
+        except Exception as error:
+            if not stage_path.is_file() or json.loads(stage_path.read_text()).get('stage') != 'hmp':
+                raise
+            response = {'optimizer_fallback': True, 'fallback_stage': 'hmp',
+                        'fallback_reason': f'{type(error).__name__}: {error}'}
+            print('[回退] HMP worker 失败，继续导出 WiLoR 结果：' + response['fallback_reason'], flush=True)
+        if response.get('optimizer_fallback') and response.get('fallback_stage') == 'hmp':
+            result = derive(tracks, 'refined', optimizer_executed=False, prior_executed=False,
+                            optimizer_stage='filtered', optimizer_fallback=True, fallback_stage='hmp',
+                            fallback_reason=response['fallback_reason'], root_smooth_completed=True,
+                            result_source='wilor_filtered')
+            return trim_boundaries(result, options.get('boundary_trim', 3))
         result = import_dynhamr_output(Path(response['artifact']), camera, len(tracks.arrays['valid']))
         if options.get('run_prior', True) and not result.meta.get('prior_executed'):
             raise ValueError('HMP was requested but optimizer did not publish prior output')

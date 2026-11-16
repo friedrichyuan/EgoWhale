@@ -142,20 +142,27 @@ def model_identity(section: str, options: dict) -> dict:
         paths = [Path(o['checkpoint']) / name for name in ('model.safetensors', 'config.json')]
     if section == 'mask':
         paths.append(repo / 'sam3/assets/bpe_simple_vocab_16e6.txt.gz')
+    prior_issue = None
     if section == 'refine':
         paths = [Path(options['wilor']['mano']), *sorted((repo / '_DATA/BMC').glob('*.npy'))]
         if len(paths) < 8:
             raise FileNotFoundError('DynHaMR BMC assets missing')
         if o.get('run_prior', True):
             from .hmp import resource_paths
-            assets = resource_paths(repo, Path(o['prior_config']))
-            absent = [str(p) for p in assets if not p.is_file()]
-            if absent:
-                raise FileNotFoundError('HMP assets missing: ' + ', '.join(absent))
-            paths.extend(assets)
+            try:
+                assets = resource_paths(repo, Path(o['prior_config']))
+                absent = [str(p) for p in assets if not p.is_file()]
+                if absent:
+                    prior_issue = 'HMP assets missing: ' + ', '.join(absent)
+                paths.extend(p for p in assets if p.is_file())
+            except ValueError as error:
+                prior_issue = str(error)
     if not Path(o['python']).is_file():
         raise FileNotFoundError(o['python'])
-    return {'repo': str(repo), 'revision': revision, 'files': [content_identity(p) for p in paths]}
+    identity = {'repo': str(repo), 'revision': revision, 'files': [content_identity(p) for p in paths]}
+    if prior_issue:
+        identity['prior_resources_issue'] = prior_issue
+    return identity
 
 
 def _run_wilor(video, camera, options, out, *, candidates=None, corrections=None):

@@ -7,7 +7,7 @@ GPU_ID="${GPU_ID:-0}"
 VIDEO="${VIDEO:-$ROOT/datasets/egodex/test/paint_clean_brush/14.mp4}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT/outputs/wilor_da3_test}"
 MAIN_PYTHON="${MAIN_PYTHON:-$ROOT/../.conda-egohand/bin/python}"
-CONFIG="${CONFIG:-$ROOT/egowhale/wilor/cfgs/wilor_hand_pipeline.yaml}"
+CONFIG="${CONFIG:-$ROOT/egowhale/wilor/cfgs/wilor.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-$OUTPUT_ROOT/$(date +%Y%m%d_%H%M%S)_$$}"
 if [[ ! -x "$MAIN_PYTHON" ]]; then echo "Python 不存在：$MAIN_PYTHON" >&2; exit 1; fi
 if [[ ! -f "$VIDEO" ]]; then echo "输入视频不存在：$VIDEO" >&2; exit 1; fi

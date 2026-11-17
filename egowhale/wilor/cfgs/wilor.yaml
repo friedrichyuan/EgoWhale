@@ -1,14 +1,110 @@
-# Full batch pipeline using WiLoR instead of EgoDex hand annotations.
-# GPU needs: the default segment/inpaint/depth/action pools plus 1 WiLoR GPU.
-# Use the serial --steps wilor command for a standalone single-GPU test.
-name: wilor
-hand_source: wilor
-episodes: datasets/egodex/test/paint_clean_brush/14.mp4
-out: outputs
-nodes:
-  wilor:
+# WiLoR 唯一配置文件。路径相对于 EgoWhale 仓库根目录，GPU 编号为物理编号。
+# MP4 -> DA3 -> WiLoR；带标注的 HDF5 请直接输入 Retarget。
+#
+# 分卡运行：bash scripts/run_wilor_split_multigpu.sh
+# 单视频：bash scripts/wilor.sh /path/video.mp4 [output_dir]
+
+# 分卡调度：DA3 和 WiLoR 使用互不重叠的显卡。
+split:
+  input_dir: datasets/egodex_fixed500_18fps
+  output_root: outputs/wilor_split_gpu_experiment
+  camera_gpus: [0, 1, 2]
+  wilor_gpus: [3, 4]
+  max_videos: 10           # 0 表示全部；先用少量视频测试
+  max_pending_camera: 4    # DA3 完成、等待 WiLoR 的队列容量
+  heartbeat_seconds: 10
+
+# 手部模型与处理参数。长视频 depth_stride=1 可能导致 DA3 显存不足；
+# 增大该值会采样帧并插值，结果与全帧推理可能不同。
+# Hand-only experiment: SAM3 + AnyHand/WiLoR + tracking + DynHaMR/HMP.
+# Run via scripts/run_hand_experiment.py, which resolves these paths.
+mode: [hand]
+hand_backend: anyhand
+anyhand_backend: wilor
+anyhand_root: thirdparty/AnyHand
+dynhamr_enabled: false
+dynhamr_required: false
+hand_mode: full
+dynhamr_root: thirdparty/Dyn-HaMR
+# Empty means the same Python interpreter that launches this experiment.
+dynhamr_python: ""
+dynhamr_timeout: 7200
+dynhamr_gpu: 0
+dynhamr_z_min: 0.15
+dynhamr_z_max: 0.4
+dynhamr_gap_fill: 3
+# HMP failure/length skip: validate smooth before replacing WiLoR.
+# Offsets are measured relative to WiLoR 2D points / image diagonal, not GT error.
+dynhamr_smooth_min_retained_ratio: 0.8
+dynhamr_smooth_max_median_offset: 0.05
+dynhamr_smooth_max_p95_offset: 0.15
+dynhamr_smooth_min_visible_ratio: 0.5
+anyhand_focal: 2500
+hand_det_thresh: 0.3
+hand_overlay_points_only: true
+sam3_checkpoint: thirdparty/sam3/checkpoints/sam3.pt
+depth_model: da3giant
+da3_model_root: thirdparty/da3/weights
+da3_process_res: 504
+depth_stride: 1
+known_intrinsics: false
+input_resolution: 480
+output_resolution: 480
+output_resize: true
+debug: false
+verbose: true
+skip_existing: true
+n_processes: 1
+robot: Panda
+gripper: Robotiq85
+square: false
+epic: false
+bimanual_setup: shoulders
+target_hand: both
+constrained_hand: true
+depth_for_overlay: false
+render: false
+camera_intrinsics: ""
+camera_extrinsics: ""
+data_root_dir: .
+processed_data_root_dir: .
+demo_name: ""
+
+# 旧独立实验入口所需配置；与上面的同步流程分开读取。
+legacy:
+  # Full hand pipeline using pinned author masks/filter/tracking/jump methods.
+  # Independent of the global batch configuration. Use a new output directory.
+  # Known K: source=provided with a sized JSON, or source=egodex with explicit HDF5.
+  camera:
+    source: da3
+    process_res: 336
+    # Validated short-video profile on this server; library defaults remain 16/8.
+    window: 128
+    overlap: 8
+  mask:
     enabled: true
-    cards: 1
-    camera_mode: wilor-default
-    # For a calibrated control, set camera_mode: egodex and provide calibration:
-    # calibration: datasets/egodex/test/paint_clean_brush/14.hdf5
+    backend: author-video
+    edge: true
+  tracking:
+    enabled: true
+    method: author
+  jump:
+    enabled: true
+    method: author
+  refine:
+    enabled: true
+    run_prior: true
+    boundary_trim: 3
+    camera_mode: author-static
+    opt_scale: false
+    root_iters: 50
+    smooth_iters: 300
+    lbfgs_max_iter: 20
+  depth_bounds:
+    enabled: true
+    min: 0.05
+    max: 0.4
+  gaps:
+    enabled: true
+  publish:
+    stage: final

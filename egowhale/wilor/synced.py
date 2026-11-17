@@ -10,10 +10,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from egowhale.media import video_path
-
 SYNC_ROOT = Path(__file__).resolve().parent / 'ego2robot_sync'
-CONFIG = Path(__file__).resolve().parent / 'cfgs/wilor_hand_pipeline.yaml'
+CONFIG = Path(__file__).resolve().parent / 'cfgs/wilor.yaml'
 RUNNER = SYNC_ROOT / 'scripts/run_hand_experiment.py'
 DEFAULT_PYTHON = Path(__file__).resolve().parents[3] / '.conda-egohand/bin/python'
 
@@ -24,13 +22,17 @@ def identity(path):
     return {'path': str(p), 'size': s.st_size, 'mtime_ns': s.st_mtime_ns}
 
 
-def signature(src, config, calibration, camera_mode, confidence, intrinsics_json=None):
+def require_mp4(src):
+    """Annotated HDF5 episodes belong to Retarget, not the prediction node."""
     src = Path(src).resolve()
-    video = video_path(src).resolve()
-    path_a = src.suffix.lower() in ('.hdf5', '.h5')
-    files = [identity(video), identity(config)]
-    if path_a:
-        files.append(identity(src))
+    if src.suffix.lower() != '.mp4':
+        raise ValueError('WiLoR 仅接受 MP4；有标注的 HDF5 请直接输入 Retarget')
+    return src
+
+
+def signature(src, config, calibration, camera_mode, confidence, intrinsics_json=None):
+    src = require_mp4(src)
+    files = [identity(src), identity(config)]
     if calibration and Path(calibration).resolve() != src:
         files.append(identity(calibration))
     if intrinsics_json:
@@ -47,7 +49,7 @@ def signature(src, config, calibration, camera_mode, confidence, intrinsics_json
     for p in sorted([*SYNC_ROOT.rglob('*.py'), *SYNC_ROOT.rglob('*.yaml')]):
         code_hash.update(str(p.relative_to(SYNC_ROOT)).encode())
         code_hash.update(p.read_bytes())
-    data = {'files': files, 'models': model_ids, 'code': code_hash.hexdigest(), 'camera_mode': camera_mode, 'path': 'a' if path_a else 'b',
+    data = {'files': files, 'models': model_ids, 'code': code_hash.hexdigest(), 'camera_mode': camera_mode, 'path': 'b',
             'confidence': confidence, 'backend': 'ego2robot_sync_v1'}
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
@@ -71,19 +73,14 @@ def convert_output(video, work):
     xyz = np.full((count, 2, 21, 3), np.nan, dtype=np.float32)
     uv = np.full((count, 2, 21, 2), np.nan, dtype=np.float32)
     valid = np.zeros((count, 2), dtype=bool)
-    # The EgoDex adapter uses wrist,index,middle,ring,little,thumb. WiLoR
-    # publishes OpenPose order: wrist,thumb,index,middle,ring,little.
-    path_a = info.get('request', {}).get('processing_path') == 'a'
-    order = np.array([0, 17, 18, 19, 20, 1, 2, 3, 4, 5, 6, 7, 8,
-                      9, 10, 11, 12, 13, 14, 15, 16]) if path_a else np.arange(21)
     for i, side in enumerate(('left', 'right')):
         with np.load(work / 'hand_processor' / f'hand_data_{side}.npz', allow_pickle=True) as hand:
             flag = np.asarray(hand['hand_detected'], dtype=bool)
             if flag.shape != (count,):
                 raise ValueError(f'{side} 手部帧数不匹配')
             valid[:, i] = flag
-            xyz[flag, i] = hand['kpts_3d'][flag][:, order]
-            uv[flag, i] = hand['kpts_2d'][flag][:, order] * np.array([sx, sy])
+            xyz[flag, i] = hand['kpts_3d'][flag]
+            uv[flag, i] = hand['kpts_2d'][flag] * np.array([sx, sy])
     return {'joints_camera': xyz, 'keypoints_2d': uv, 'valid': valid,
             # The reference final files do not contain per-frame confidence or boxes.
             'confidence': np.full((count, 2), np.nan, dtype=np.float32),
@@ -92,12 +89,11 @@ def convert_output(video, work):
             'timestamps': np.arange(count) / fps, 'fps': np.float32(fps)}
 
 
-def run(src, dst, config, python, camera_mode, calibration, confidence, intrinsics_json=None):
+def run(src, dst, config, python, camera_mode, calibration, confidence, intrinsics_json=None, runner=None):
     from egowhale.wilor.step import file_identity, save_prediction
-    src, dst = Path(src).resolve(), Path(dst).resolve()
-    video = video_path(src).resolve()
-    path_a = src.suffix.lower() in ('.hdf5', '.h5')
-    if not path_a and (calibration or intrinsics_json or camera_mode not in ('auto', 'wilor-default', 'da3')):
+    src, dst = require_mp4(src), Path(dst).resolve()
+    video = src
+    if calibration or intrinsics_json or camera_mode not in ('auto', 'wilor-default', 'da3'):
         raise ValueError('MP4 输入固定使用 Path B 和 DA3；不能指定其他相机参数')
     work = dst / 'action/wilor_ego2robot'
     work.mkdir(parents=True, exist_ok=True)
@@ -112,29 +108,21 @@ def run(src, dst, config, python, camera_mode, calibration, confidence, intrinsi
         marker_file.write_text(json.dumps({'signature': run_signature}, indent=2))
     if confidence != .3:
         raise ValueError('请在同步配置 YAML 中设置 hand_det_thresh；不支持旧 confidence 覆盖')
-    cameras = {'wilor-default': 'auto', 'auto': 'auto', 'egodex': 'egodex', 'da3': 'da3', 'provided': 'provided'}
-    if camera_mode not in cameras:
-        raise ValueError(f'不支持的相机来源: {camera_mode}')
     cmd = [str(python), '-u', str(RUNNER), '--video', str(src), '--output', str(work),
-           '--config', str(config), '--path', 'a' if path_a else 'b',
-           '--camera-source', cameras[camera_mode] if path_a else 'da3']
-    if not path_a:
-        cmd.append('--video-only')
-    if calibration:
-        cmd += ['--intrinsics-h5', str(calibration)]
-    if intrinsics_json:
-        cmd += ['--intrinsics-json', str(intrinsics_json)]
+           '--config', str(config), '--path', 'b', '--camera-source', 'da3', '--video-only']
     env = os.environ.copy()
     thirdparty = Path(env.get('EGOWHALE_WILOR_THIRDPARTY', SYNC_ROOT.parents[2] / 'thirdparty')).resolve()
     paths = (SYNC_ROOT, thirdparty / 'da3/src', thirdparty / 'sam3', thirdparty / 'human_body_prior/src')
     env['PYTHONPATH'] = os.pathsep.join([*(str(path) for path in paths), env.get('PYTHONPATH', '')])
-    subprocess.run(cmd, env=env, cwd=SYNC_ROOT, check=True)
+    if runner is None:
+        subprocess.run(cmd, env=env, cwd=SYNC_ROOT, check=True)
+    else:
+        runner(cmd[3:])
     result = convert_output(video, work)
-    used_h5 = (Path(calibration).resolve() if calibration else src) if path_a else None
     marker = json.loads((work / 'full_completed.json').read_text())
     metadata = {'signature': run_signature,
                 'input': file_identity(video), 'frames': len(result['valid']),
-                'calibration_input': file_identity(used_h5) if used_h5 and used_h5.is_file() else None,
+                'calibration_input': None,
                 'intrinsics_json_input': file_identity(Path(intrinsics_json)) if intrinsics_json else None,
                 'options': {'camera_mode': camera_mode, 'calibration': str(calibration) if calibration else None,
                             'confidence': confidence, 'intrinsics_json': str(intrinsics_json) if intrinsics_json else None},

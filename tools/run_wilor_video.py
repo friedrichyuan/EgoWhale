@@ -34,7 +34,7 @@ def resolve(value):
 def settings(mode, da3_python, wilor_python, samples, batch, sam3_python=None, dynhamr_python=None):
     if samples < 1 or batch < 1:
         raise ValueError('DA3_SAMPLES and BATCH_SIZE must be positive')
-    given = yaml.safe_load((ROOT / 'egowhale/wilor/cfgs/wilor_legacy_pipeline.yaml').read_text()) if mode == 'full' else {}
+    given = yaml.safe_load((ROOT / 'egowhale/wilor/cfgs/wilor.yaml').read_text())['legacy'] if mode == 'full' else {}
     # Unknown intrinsics are an enforced input contract, not an optional calibration mode.
     given['camera'] = {**given.get('camera', {}), 'source': 'da3', 'calibration': None,
                        'poses': None, 'motion': False, 'python': str(resolve(da3_python)), 'samples': samples}

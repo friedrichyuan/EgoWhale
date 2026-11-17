@@ -222,6 +222,8 @@ class WiLoR(Step):
             raise FileNotFoundError(f'WiLoR Python not found: {self.python}')
 
     def run(self, src: Path, dst: Path):
+        from egowhale.wilor.synced import require_mp4
+        src = require_mp4(src)
         self.validate_outputs(src, dst)
         if (Path(dst) / HANDS_WILOR_META).is_file():
             return

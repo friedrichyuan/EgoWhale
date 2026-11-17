@@ -62,7 +62,7 @@ class DepthPoseProcessor(BaseProcessor):
 
         T, H, W = len(frames_rgb), frames_rgb[0].shape[0], frames_rgb[0].shape[1]
         logger.info(f"[depth_pose] {T} frames, {W}x{H}, fps={fps}")
-        report_progress("DA3 相机估计", message=f"读取 {T} 帧，加载 DA3 模型")
+        report_progress("DA3 相机估计", message=f"读取 {T} 帧，" + ("加载 DA3 模型" if self._model is None else "复用 DA3 模型"))
 
         # ── Run DA3 (with optional stride to reduce memory) ──
         self._ensure_model()

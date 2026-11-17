@@ -285,6 +285,7 @@ class HandProcessor(BaseProcessor):
         T = len(frames_rgb)
         status = getattr(self, "optimization_status", {})
         overlay_stage = ("优化前标注视频" if suffix else
+                         "smooth 优化后标注视频" if status.get("result_source") == "smooth_fit" else
                          "回退结果标注视频" if status.get("fallback") else
                          "优化后标注视频" if status.get("succeeded") else "手部标注视频")
         report_progress(overlay_stage, 0, T)
@@ -683,10 +684,31 @@ class HandProcessor(BaseProcessor):
         success = self._run_dynhamr_subprocess(dynhamr_root, dh_test_dir, seq_name)
         if not success:
             hmp_reason = self._hmp_fallback_reason
+            quality = None
+            if hmp_reason:
+                quality = self._try_smooth_fallback(
+                    dynhamr_root, dh_test_dir, seq_name, save_dir,
+                    fx, fy, cx, cy, T, H, W, gap_fill, z_min, z_max)
+                if quality["accepted"]:
+                    self.optimization_status = {
+                        "succeeded": True, "fallback": True, "stage": "hmp",
+                        "result_source": "smooth_fit", "root_smooth_completed": True,
+                        "prior_executed": False, "hmp_succeeded": False,
+                        "hmp_skipped": getattr(self, "_hmp_skipped", False),
+                        "reason": hmp_reason, "quality": quality,
+                    }
+                    (Path(data_sub_folder) / "optimization_status.json").write_text(
+                        json.dumps(self.optimization_status, ensure_ascii=False, indent=2))
+                    report_progress("smooth 检查通过，使用优化结果生成视频")
+                    return
             if not hmp_reason and self.cfg.get("dynhamr_required", False):
                 raise RuntimeError("DynHaMR optimization failed; see dynhamr_stdout.log and dynhamr_stderr.log in the demo directory")
             self.optimization_status = {"succeeded": False, "fallback": True, "stage": "hmp" if hmp_reason else "dynhamr",
                                         "result_source": "wilor_filtered", "reason": hmp_reason or "DynHaMR optimization failed"}
+            if quality is not None:
+                self.optimization_status.update(quality=quality, prior_executed=False,
+                                                root_smooth_completed=True, hmp_succeeded=False,
+                                                hmp_skipped=getattr(self, "_hmp_skipped", False))
             (Path(data_sub_folder) / "optimization_status.json").write_text(json.dumps(self.optimization_status, ensure_ascii=False, indent=2))
             logger.warning("[dynhamr] %s; keeping WiLoR predictions and exporting video", self.optimization_status["reason"])
             report_progress("优化失败回退，继续生成视频", message=self.optimization_status["reason"])
@@ -698,6 +720,38 @@ class HandProcessor(BaseProcessor):
                                   fx, fy, cx, cy, T, gap_fill, z_min, z_max)
         self.optimization_status = {"succeeded": True, "fallback": False, "result_source": "hmp"}
         (Path(data_sub_folder) / "optimization_status.json").write_text(json.dumps(self.optimization_status, indent=2))
+
+    def _try_smooth_fallback(self, dynhamr_root, dh_test_dir, seq_name, save_dir,
+                             fx, fy, cx, cy, T, H, W, gap_fill, z_min, z_max):
+        """Validate a completed smooth result before replacing any WiLoR files."""
+        from ego2robot.utils.optimization_quality import assess_smooth_result
+        report_progress("smooth 结果质量检查")
+        try:
+            source = getattr(self, "_smooth_result_path", None)
+            if not source:
+                raise FileNotFoundError("this run did not record a completed smooth result")
+            # The subprocess supplies its exact completed stage, including iteration.
+            # Never select an initial or unrelated result from another day's cache.
+            if Path(source).parent.name != "smooth_fit" or not Path(source).is_file():
+                raise FileNotFoundError(f"invalid smooth result: {source}")
+            baseline = {}
+            for side in ("left", "right"):
+                with np.load(save_dir / f"hand_data_{side}.npz", allow_pickle=True) as data:
+                    baseline[side] = dict(data)
+            candidate = self._postprocess_dynhamr(
+                dynhamr_root, dh_test_dir, seq_name, save_dir,
+                fx, fy, cx, cy, T, gap_fill, z_min, z_max,
+                result_path=source, write_output=False)
+            quality = assess_smooth_result(baseline, candidate, T, W, H, self.cfg)
+            quality["source_file"] = str(source)
+            if quality["accepted"]:
+                self._write_dynhamr_hands(save_dir, candidate)
+            else:
+                logger.warning("[dynhamr] smooth rejected: %s", "; ".join(quality["reasons"]))
+            return quality
+        except Exception as error:
+            logger.warning("[dynhamr] smooth unavailable or invalid: %s", error)
+            return {"accepted": False, "reasons": [f"{type(error).__name__}: {error}"]}
 
     def _prepare_dynhamr_images(self, frames_rgb, dh_test_dir, seq_name):
         """Save video frames as JPGs for DynHaMR."""
@@ -773,7 +827,7 @@ class HandProcessor(BaseProcessor):
         cam_data = {
             "w2c": w2c,
             "focal": np.float64(gt_focal),
-            "intrins": np.tile(np.array([gt_focal, gt_focal, cx, cy]), (T, 1)),
+            "intrins": np.tile(np.array([fx, fy, cx, cy]), (T, 1)),
             "width": np.int64(W),
             "height": np.int64(H),
         }
@@ -816,9 +870,12 @@ class HandProcessor(BaseProcessor):
         log_dir.mkdir(parents=True, exist_ok=True)
         hmp_status = log_dir / "hmp_fallback.json"
         hmp_status.unlink(missing_ok=True)
+        (log_dir / "smooth_completed.json").unlink(missing_ok=True)
         hmp_running = log_dir / "hmp_running.json"
         hmp_running.unlink(missing_ok=True)
         self._hmp_fallback_reason = None
+        self._smooth_result_path = None
+        self._hmp_skipped = False
         cmd += ["--hmp-fallback-status", str(hmp_status.resolve())]
         try:
             result = run_streamed_command(
@@ -832,6 +889,7 @@ class HandProcessor(BaseProcessor):
                                ("prior optimization time", "DynHaMR/HMP 结果保存")))
             if result.returncode != 0:
                 if hmp_running.is_file():
+                    self._smooth_result_path = json.loads(hmp_running.read_text()).get("smooth_result")
                     self._hmp_fallback_reason = f"HMP worker exited with code {result.returncode}: {result.stderr[-500:]}"
                     return False
                 logger.error(f"[dynhamr] Failed: {result.stderr[-500:]}")
@@ -840,12 +898,15 @@ class HandProcessor(BaseProcessor):
             if hmp_status.is_file():
                 status = json.loads(hmp_status.read_text())
                 if status.get("stage") == "hmp" and status.get("fallback"):
+                    self._smooth_result_path = status.get("smooth_result")
+                    self._hmp_skipped = status.get("skipped", False)
                     self._hmp_fallback_reason = status["reason"]
                     return False
             logger.info("[dynhamr] Optimization completed")
             return True
         except sp.TimeoutExpired:
             if hmp_running.is_file():
+                self._smooth_result_path = json.loads(hmp_running.read_text()).get("smooth_result")
                 self._hmp_fallback_reason = "HMP worker timed out"
                 return False
             logger.error("[dynhamr] Timeout")
@@ -861,8 +922,9 @@ class HandProcessor(BaseProcessor):
             logger.info(f"[dynhamr] Cleaned partial output: {d}")
 
     def _postprocess_dynhamr(self, dynhamr_root, dh_test_dir, seq_name, save_dir,
-                              fx, fy, cx, cy, T, gap_fill, z_min, z_max):
-        """Read DynHaMR output, post-process, overwrite hand_data_*.npz."""
+                              fx, fy, cx, cy, T, gap_fill, z_min, z_max,
+                              *, result_path=None, write_output=True):
+        """Build hand arrays from prior or smooth, optionally publishing them."""
         import torch
         import sys
         import glob
@@ -876,22 +938,31 @@ class HandProcessor(BaseProcessor):
         # Find output npz
         pattern = os.path.join(dynhamr_root, "outputs", "logs", "video-custom", "*",
                                f"{seq_name}-*", "prior", f"{seq_name}_000000_world_results.npz")
-        npz_files = sorted(glob.glob(pattern))
+        npz_files = [str(result_path)] if result_path is not None else sorted(glob.glob(pattern))
         if not npz_files:
             if self.cfg.get("dynhamr_required", False):
                 raise FileNotFoundError(f"DynHaMR did not produce motion-prior output: {pattern}")
             logger.warning(f"[dynhamr] No output found: {pattern}")
-            return
+            return {}
         npz_path = npz_files[-1]
         logger.info(f"[dynhamr] Loading {npz_path}")
 
-        npz = np.load(npz_path)
-        trans = npz['trans']
-        orient = npz['root_orient']
-        pose = npz['pose_body']
-        betas = npz['betas']
-        is_right = npz['is_right']
+        with np.load(npz_path) as npz:
+            trans, orient, pose, betas, is_right = (npz[key] for key in
+                ('trans', 'root_orient', 'pose_body', 'betas', 'is_right'))
+        if trans.ndim != 3 or trans.shape[-1] != 3:
+            raise ValueError("invalid optimized translation shape")
         N_hands, T_dh = trans.shape[:2]
+        if (not 1 <= N_hands <= 2 or not 1 <= T_dh <= T
+                or orient.shape != (N_hands, T_dh, 3)
+                or pose.shape[:2] != (N_hands, T_dh) or pose.size != N_hands * T_dh * 45
+                or betas.shape != (N_hands, 10) or is_right.shape != (N_hands, T_dh)
+                or not all(np.isfinite(a).all() for a in (trans, orient, pose, betas, is_right))):
+            raise ValueError("invalid optimized MANO arrays")
+        if (not np.isin(is_right, [0, 1]).all()
+                or not (is_right == is_right[:, :1]).all()
+                or len(np.unique(is_right[:, 0])) != N_hands):
+            raise ValueError("invalid optimized hand identities")
 
         # Find start frame from track_preds
         track_dir = os.path.join(dh_test_dir, "dynhamr", "track_preds", seq_name)
@@ -905,6 +976,8 @@ class HandProcessor(BaseProcessor):
             det_per_tid[tid] = frames
             all_frames.update(frames)
         start_frame = min(all_frames) if all_frames else 0
+        if start_frame < 0 or start_frame + T_dh > T:
+            raise ValueError("optimized frames do not fit the video timeline")
 
         # Build detection masks
         mano_model = MANO(
@@ -913,6 +986,7 @@ class HandProcessor(BaseProcessor):
             is_rhand=True
         )
 
+        updated_hands = {}
         for h in range(N_hands):
             hand_right = bool(is_right[h, 0] > 0.5)
             side = "right" if hand_right else "left"
@@ -966,6 +1040,8 @@ class HandProcessor(BaseProcessor):
                 if not hand_right:
                     j3d[:, 0] = -j3d[:, 0]
 
+                if not np.isfinite(j3d).all() or (j3d[:, 2] <= 0).any():
+                    continue
                 wrist_z = j3d[0, 2]
                 if wrist_z < z_min or wrist_z > z_max:
                     continue
@@ -980,14 +1056,29 @@ class HandProcessor(BaseProcessor):
             logger.info(f"[dynhamr] {side}: {len(det_ids)} frames after post-processing")
 
             # Overwrite hand_data npz
-            old = dict(np.load(str(save_dir / f"hand_data_{side}.npz"), allow_pickle=True))
+            with np.load(save_dir / f"hand_data_{side}.npz", allow_pickle=True) as previous:
+                old = dict(previous)
             old['kpts_3d'] = kpts_3d
             old['kpts_2d'] = kpts_2d
             old['hand_detected'] = hand_detected
             old['eef_rot'] = eef_rot
             old['detected_frame_ids'] = det_ids
-            np.savez_compressed(str(save_dir / f"hand_data_{side}.npz"), **old)
+            updated_hands[side] = old
 
+        if write_output:
+            self._write_dynhamr_hands(save_dir, updated_hands)
+        return updated_hands
+
+    @staticmethod
+    def _write_dynhamr_hands(save_dir, hands):
+        """Serialize all hands before replacing published files."""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix=".dynhamr-", dir=save_dir) as temporary:
+            for side, data in hands.items():
+                np.savez_compressed(Path(temporary) / f"hand_data_{side}.npz", **data)
+            for side in hands:
+                name = f"hand_data_{side}.npz"
+                os.replace(Path(temporary) / name, save_dir / name)
         logger.info("[dynhamr] Post-processing done, hand_data_*.npz updated")
 
     def _generate_hand_masks(self, frames_rgb, save_path):

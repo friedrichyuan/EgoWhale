@@ -75,7 +75,7 @@ class AnyHandWrapper:
         Uses split detect → override handedness → reconstruct flow so that
         the model processes each hand with correct image flip.
         """
-        report_progress("WiLoR 模型加载", message="加载 AnyHand/WiLoR 权重")
+        report_progress("WiLoR 模型加载", message="加载 AnyHand/WiLoR 权重" if self._predictor is None else "复用 AnyHand/WiLoR 模型")
         self._ensure_loaded()
 
         T = len(frames_rgb)

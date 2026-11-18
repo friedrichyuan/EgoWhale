@@ -6,17 +6,16 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--video', type=Path, required=True)
+    parser.add_argument('--video', type=Path, required=True, help='MP4 视频；有标注的 HDF5 请直接输入 Retarget')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--config', type=Path)
     parser.add_argument('--python', type=Path)
-    parser.add_argument('--camera-source', choices=('auto', 'egodex', 'provided', 'da3'), default='auto')
-    parser.add_argument('--intrinsics-h5', type=Path)
-    parser.add_argument('--intrinsics-json', type=Path)
+    parser.add_argument('--camera-source', choices=('auto', 'da3'), default='auto')
     args = parser.parse_args()
+    if args.video.suffix.lower() != '.mp4':
+        parser.error('WiLoR 仅接受 MP4；有标注的 HDF5 请直接输入 Retarget')
     from egowhale.wilor.step import WiLoR
-    node = WiLoR(camera_mode=args.camera_source, calibration=args.intrinsics_h5,
-                 python=args.python, pipeline_config=args.config, intrinsics_json=args.intrinsics_json)
+    node = WiLoR(camera_mode=args.camera_source, python=args.python, pipeline_config=args.config)
     try:
         node.run(args.video.resolve(), args.output.resolve())
     finally:

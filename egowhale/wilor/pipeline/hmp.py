@@ -26,11 +26,13 @@ def resource_paths(repo: Path, config: Path) -> list[Path]:
               ('local_encoder.pth', 'global_encoder.pth', 'nemf.pth'))]
 
 
-def windows(count: int) -> list[tuple[int, int]]:
+def windows(count: int, overlap: int = OVERLAP) -> list[tuple[int, int]]:
     if count < 1:
         raise ValueError('HMP requires a nonempty timeline')
+    if not 0 <= overlap < WINDOW:
+        raise ValueError("Invalid HMP overlap")
     spans = []
-    for start in range(0, count, WINDOW - OVERLAP):
+    for start in range(0, count, WINDOW - overlap):
         spans.append((start, min(start + WINDOW, count)))
         if spans[-1][1] == count:
             break
@@ -94,7 +96,6 @@ def run_prior(cfg, dataset, output: Path, device, upstream, options: dict, image
     from body_model import MANO
     from omegaconf import OmegaConf
     from torch.utils.data import DataLoader
-    from util.tensor import move_to
 
     from .progress import report
     from .workers.dynhamr import physical_run_mano
@@ -111,7 +112,7 @@ def run_prior(cfg, dataset, output: Path, device, upstream, options: dict, image
     with np.load(source, allow_pickle=False) as data:
         base = {k: np.asarray(data[k]) for k in data.files}
     hands, count = base['trans'].shape[:2]
-    obs = move_to(next(iter(DataLoader(dataset, batch_size=len(dataset), shuffle=False))), device)
+    obs = next(iter(DataLoader(dataset, batch_size=len(dataset), shuffle=False)))
     model = MANO(batch_size=WINDOW, pose2rot=True,
                  **{k.lower(): v for k, v in dict(cfg.MANO).items()}).to(device)
     chunks = []

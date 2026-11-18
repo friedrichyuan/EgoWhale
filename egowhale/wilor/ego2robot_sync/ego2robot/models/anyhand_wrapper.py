@@ -68,40 +68,30 @@ class AnyHandWrapper:
         finally:
             os.chdir(prev_cwd)
 
-    def predict(self, frames_rgb: list, focal_length: float,
-                img_center: tuple = None) -> dict:
-        """Run AnyHand on video frames.
-
-        Uses split detect → override handedness → reconstruct flow so that
-        the model processes each hand with correct image flip.
-        """
-        report_progress("WiLoR 模型加载", message="加载 AnyHand/WiLoR 权重")
+    def candidates(self, frames_rgb, count):
+        """Yield all hands before camera calibration or temporal filtering."""
+        report_progress("WiLoR 模型加载", message="加载 AnyHand/WiLoR 权重" if self._predictor is None else "复用 AnyHand/WiLoR 模型")
         self._ensure_loaded()
+        run = self._predictor._run_wilor if self.backend == "wilor" else self._predictor._run_hamer
+        for t, frame in enumerate(frames_rgb):
+            if t % 30 == 0:
+                report_progress("WiLoR 逐帧预测", t, count)
+            img_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            boxes, is_right, scores = self._predictor._detect_hands(img_bgr)
+            for i, box in enumerate(boxes):
+                is_right[i] = (box[0] + box[2]) / 2.0 >= frame.shape[1] / 2.0
+            yield run(img_bgr, boxes, is_right, scores) if len(boxes) else []
+        report_progress("WiLoR 逐帧预测", count, count)
 
-        T = len(frames_rgb)
-        H, W = frames_rgb[0].shape[:2]
+    def predict(self, frames_rgb: list, focal_length: float, img_center: tuple = None):
+        return self.calibrate(self.candidates(frames_rgb, len(frames_rgb)), focal_length, include_mesh=True)
 
+    @classmethod
+    def calibrate(cls, candidates, focal_length, *, include_mesh=False):
+        """Choose one candidate per side and apply the basic branch's focal correction."""
         left_results = {}
         right_results = {}
-
-        for t in range(T):
-            if t % 30 == 0:
-                report_progress("WiLoR 逐帧预测", t, T)
-            img_bgr = cv2.cvtColor(frames_rgb[t], cv2.COLOR_RGB2BGR)
-
-            # Step 1: detect hands (YOLO)
-            boxes, is_right, scores = self._predictor._detect_hands(img_bgr)
-            if len(boxes) == 0:
-                continue
-
-            # Step 2: override handedness by bbox center position
-            for i in range(len(boxes)):
-                box_cx = (boxes[i][0] + boxes[i][2]) / 2.0
-                is_right[i] = box_cx >= W / 2.0
-
-            # Step 3: reconstruct with corrected handedness
-            hands = self._predictor._run_wilor(img_bgr, boxes, is_right, scores)
-
+        for t, hands in enumerate(candidates):
             for hand in hands:
                 # Rescale cam_t.Z from AnyHand's internal focal (hand.focal_length,
                 # typically 2500 for WiLoR backend on 640x480 input) to the real
@@ -111,7 +101,6 @@ class AnyHandWrapper:
                 cam_t_scaled = hand.cam_t.copy()
                 cam_t_scaled[2] *= z_scale
                 joints_cam = hand.keypoints_3d + cam_t_scaled[None, :]
-                verts_cam = hand.vertices + cam_t_scaled[None, :]
 
                 entry = {
                     "betas": hand.mano_shape,
@@ -122,26 +111,25 @@ class AnyHandWrapper:
                     # Keep the original model camera for 2D projection. The
                     # metric-scaled depth above uses a different focal length.
                     "projection_joints_cam": hand.keypoints_3d + hand.cam_t[None, :],
-                    "vertices": hand.vertices,
-                    "verts_cam": verts_cam,
                     "projection_focal": hand.focal_length,
                     "score": hand.score,
                 }
+
+                if include_mesh:
+                    entry["verts_cam"] = hand.vertices + cam_t_scaled[None, :]
 
                 target = right_results if hand.is_right else left_results
                 if t not in target or hand.score > target[t]["score"]:
                     target[t] = entry
 
-        report_progress("WiLoR 逐帧预测", T, T)
         result = {}
         for hand_name, hand_results in [("left", left_results), ("right", right_results)]:
             if not hand_results:
-                result[hand_name] = self._empty_hand()
+                result[hand_name] = cls._empty_hand()
                 continue
 
             frame_ids = sorted(hand_results.keys())
             joints_cam = np.stack([hand_results[f]["joints_cam"] for f in frame_ids])
-            verts_cam = np.stack([hand_results[f]["verts_cam"] for f in frame_ids])
 
             result[hand_name] = {
                 'frame_ids': frame_ids,
@@ -151,9 +139,11 @@ class AnyHandWrapper:
                 'transl': [hand_results[f]["transl"] for f in frame_ids],
                 'joints_cam': joints_cam,
                 'projection_joints_cam': np.stack([hand_results[f]["projection_joints_cam"] for f in frame_ids]),
-                'verts_cam': verts_cam,
                 'projection_focal': hand_results[frame_ids[0]]["projection_focal"],
             }
+
+            if include_mesh:
+                result[hand_name]["verts_cam"] = np.stack([hand_results[f]["verts_cam"] for f in frame_ids])
 
         return result
 

@@ -18,15 +18,25 @@ REFERENCE = ROOT.parent / 'ego2robot_blog'
 
 class SyncedNodeTests(unittest.TestCase):
     @unittest.skipUnless(REFERENCE.is_dir(), 'reference checkout unavailable')
-    def test_hand_implementation_and_config_match_reference(self):
-        for relative in ('ego2robot/processors/hand_processor.py', 'ego2robot/processors/depth_pose_processor.py',
-                         'ego2robot/models/anyhand_wrapper.py', 'ego2robot/models/wilor_wrapper.py',
+    def test_unmodified_modules_and_base_config_match_reference(self):
+        # EgoWhale intentionally extends hand_processor/run_dynhamr with validated
+        # smooth fallback; those branches are exercised in test_wilor_smooth_fallback.
+        # DA3 sampling and AnyHand candidate extraction are now WiLoR-specific adapters.
+        for relative in ('ego2robot/models/wilor_wrapper.py',
                          'ego2robot/models/da3_wrapper.py', 'ego2robot/utils/legacy_mano.py',
-                         'ego2robot/utils/progress.py', 'ego2robot/utils/egodex_path_a.py',
-                         'scripts/run_dynhamr.py', 'configs/hand_experiment.yaml'):
+                         'ego2robot/utils/progress.py',
+                         ):
             with self.subTest(file=relative):
-                self.assertEqual((synced.SYNC_ROOT / relative).read_bytes(), (REFERENCE / relative).read_bytes())
-        self.assertEqual(synced.CONFIG.read_bytes(), (REFERENCE / 'configs/hand_experiment.yaml').read_bytes())
+                actual = (synced.SYNC_ROOT / relative).read_text()
+                expected = (REFERENCE / relative).read_text()
+                self.assertEqual(actual, expected)
+        import yaml
+        config = yaml.safe_load(synced.CONFIG.read_text())
+        local_overrides = ('split', 'resident', 'legacy', 'long_video', 'save_depth_maps', 'min_hand_detection_rate')
+        hand_config = {k: v for k, v in config.items() if k not in local_overrides}
+        self.assertEqual(hand_config, yaml.safe_load((synced.SYNC_ROOT / 'configs/hand_experiment.yaml').read_text()))
+        base = {k: v for k, v in hand_config.items() if not k.startswith('dynhamr_smooth_')}
+        self.assertEqual(base, yaml.safe_load((REFERENCE / 'configs/hand_experiment.yaml').read_text()))
 
     def test_node_publishes_same_points_with_egowhale_coordinate_scale(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -70,41 +80,35 @@ class SyncedNodeTests(unittest.TestCase):
                 self.assertTrue(np.isnan(result['confidence']).all())
             node.validate_outputs(video, root / 'out')
 
-    def test_hdf5_uses_path_a_and_publishes_wilor_joint_order(self):
+    def test_hdf5_is_rejected_before_starting_or_creating_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            video, h5 = root / 'episode.mp4', root / 'episode.hdf5'
-            writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*'mp4v'), 10., (80, 48))
-            self.assertTrue(writer.isOpened())
-            writer.write(np.zeros((48, 80, 3), dtype=np.uint8))
-            writer.release()
-            h5.write_bytes(b'fake HDF5 read only by mocked worker')
-            def fake_runner(command, **kwargs):
-                self.assertEqual(command[command.index('--video') + 1], str(h5))
-                self.assertEqual(command[command.index('--path') + 1], 'a')
-                self.assertEqual(command[command.index('--camera-source') + 1], 'auto')
-                self.assertNotIn('--video-only', command)
-                work = Path(command[command.index('--output') + 1]); hands = work / 'hand_processor'
-                hands.mkdir(parents=True, exist_ok=True)
-                (work / 'input.json').write_text(json.dumps({'frames': 1, 'fps': 10., 'size': [80, 48],
-                    'request': {'processing_path': 'a'}}))
-                (work / 'cam_intrinsics.json').write_text(json.dumps({'left': {'fx': 50., 'fy': 50., 'cx': 40., 'cy': 24.}}))
-                xyz = np.ones((1, 21, 3), dtype=np.float32); xyz[0, :, 0] = np.arange(21)
-                for side in ('left', 'right'):
-                    np.savez(hands / f'hand_data_{side}.npz', hand_detected=np.array([True]),
-                             kpts_3d=xyz, kpts_2d=np.ones((1, 21, 2)))
-                (work / 'full_completed.json').write_text(json.dumps({'path': 'a', 'camera_source': 'egodex',
-                    'optimization': {'result_source': 'egodex_annotations', 'fallback': False}}))
-                return subprocess.CompletedProcess(command, 0)
-            node = WiLoR()
-            with patch('egowhale.wilor.synced.subprocess.run', side_effect=fake_runner):
-                node.run(h5, root / 'out')
-            with np.load(root / 'out/action/hands_wilor.npz') as result:
-                np.testing.assert_array_equal(result['joints_camera'][0, 0, :, 0],
-                    [0, 17, 18, 19, 20, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
-            meta = validate_prediction_input(h5, root / 'out')
-            self.assertEqual(meta['processing_path'], 'a')
-            self.assertEqual(meta['optimization']['result_source'], 'egodex_annotations')
+            for extension in ('.hdf5', '.h5'):
+                source = root / f'episode{extension}'
+                source.write_bytes(b'annotated episode')
+                output = root / 'out'
+                with self.subTest(extension=extension), \
+                     patch('egowhale.wilor.synced.subprocess.run') as runner:
+                    with self.assertRaisesRegex(ValueError, 'Retarget'):
+                        WiLoR().run(source, output)
+                    with self.assertRaisesRegex(ValueError, 'Retarget'):
+                        synced.run(source, output, synced.CONFIG, Path('python'), 'auto', None, .3)
+                    runner.assert_not_called()
+                    self.assertFalse(output.exists())
+
+    def test_both_cli_entries_reject_hdf5_and_path_a_without_models(self):
+        import sys
+        for entry in ([sys.executable, '-m', 'egowhale.wilor'],
+                      [sys.executable, str(synced.RUNNER)]):
+            with self.subTest(entry=entry):
+                result = subprocess.run([*entry, '--video', 'episode.hdf5', '--output', '/unused'],
+                                        cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('Retarget', result.stderr)
+        result = subprocess.run([sys.executable, str(synced.RUNNER), '--path', 'a'],
+                                cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('invalid choice', result.stderr)
 
 
 if __name__ == '__main__':

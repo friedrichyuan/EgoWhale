@@ -15,6 +15,7 @@ import numpy as np
 from egowhale.media import video_path
 from egowhale.paths import HANDS_WILOR, HANDS_WILOR_META, ROOT, THIRDPARTY
 from egowhale.step import Step
+from egowhale.wilor.retarget_export import RETARGET_HDF5, RETARGET_VIDEO, validate_retarget
 from egowhale.wilor.camera import project
 
 
@@ -78,6 +79,8 @@ def validate_prediction_input(src: Path, dst: Path, options: dict | None = None)
         if str(result['signature']) != meta['signature']:
             raise ValueError('WiLoR NPZ/metadata mismatch')
         validate_legacy_prediction(result, meta.get('frames'), require_positive_depth=meta.get('source') != 'ego2robot_sync')
+    if meta.get('retarget_hdf5'):
+        validate_retarget(Path(dst), meta['signature'], meta['frames'])
     marked = meta.get('calibration_input')
     if marked is not None and file_identity(Path(marked['path'])) != marked:
         raise ValueError('WiLoR calibration input changed; use a new output directory')
@@ -182,7 +185,7 @@ class WorkerClient:
 
 class WiLoR(Step):
     name = 'wilor'
-    makes = (HANDS_WILOR, HANDS_WILOR_META)
+    makes = (HANDS_WILOR, HANDS_WILOR_META, RETARGET_HDF5, RETARGET_VIDEO)
     gpus = 1
 
     def __init__(self, camera_mode='wilor-default', calibration=None, python=None, confidence=.3, timeout=1800, pipeline_config: str | Path | None = None, intrinsics_json=None):
@@ -216,12 +219,16 @@ class WiLoR(Step):
             if str(result['signature']) != marked['signature']:
                 raise ValueError('WiLoR NPZ/metadata mismatch')
             validate_legacy_prediction(result, marked.get('frames'), require_positive_depth=marked.get('source') != 'ego2robot_sync')
+        if marked.get('retarget_hdf5'):
+            validate_retarget(Path(dst), marked['signature'], marked['frames'])
 
     def load(self):
         if not self.python.is_file():
             raise FileNotFoundError(f'WiLoR Python not found: {self.python}')
 
     def run(self, src: Path, dst: Path):
+        from egowhale.wilor.synced import require_mp4
+        src = require_mp4(src)
         self.validate_outputs(src, dst)
         if (Path(dst) / HANDS_WILOR_META).is_file():
             return

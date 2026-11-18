@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
-# 修改下面的 GPU 编号、输入目录和输出目录；每张卡处理不同视频。
+# 兼容旧入口；GPU 分组及输入输出请在 egowhale/wilor/cfgs/wilor.yaml 修改。
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GPU_IDS="${GPU_IDS:-0,1,2,3,4,5}"
-INPUT_DIR="${INPUT_DIR:-$ROOT/datasets/egodex/test/add_remove_lid}"
-OUTPUT_DIR="${OUTPUT_DIR:-$ROOT/outputs/wilor_add_remove_lid}"
-MAIN_PYTHON="${MAIN_PYTHON:-$ROOT/../.conda-egohand/bin/python}"
-CONFIG="${CONFIG:-$ROOT/egowhale/wilor/cfgs/wilor_hand_pipeline.yaml}"
-CAMERA_SOURCE="${CAMERA_SOURCE:-da3}"   # MP4 固定使用 DA3 估计相机
-MAX_VIDEOS="${MAX_VIDEOS:-0}"            # 0 = 全部；可先设 1 测试
-HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-10}"
-cd "$ROOT"
-exec "$MAIN_PYTHON" -u tools/batch_wilor_ego2robot.py --input "$INPUT_DIR" --output-root "$OUTPUT_DIR" \
-  --gpu-ids "$GPU_IDS" --python "$MAIN_PYTHON" --config "$CONFIG" --camera-source "$CAMERA_SOURCE" \
-  --max-videos "$MAX_VIDEOS" --heartbeat "$HEARTBEAT_SECONDS" "$@"
+for name in GPU_IDS INPUT_DIR OUTPUT_DIR DATASET_DIR OUTPUT_ROOT MAX_VIDEOS HEARTBEAT_SECONDS CONFIG; do
+  if [[ -n "${!name:-}" ]]; then
+    echo "旧环境变量 $name 不再生效，请在 egowhale/wilor/cfgs/wilor.yaml 的 split 中配置；视频数也可使用 --max-videos。" >&2
+    exit 2
+  fi
+done
+echo "旧批处理入口已切换为 DA3 / WiLoR 分卡调度。" >&2
+exec bash "$ROOT/scripts/run_wilor_split_multigpu.sh" "$@"

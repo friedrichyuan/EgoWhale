@@ -15,6 +15,12 @@ dynhamr_gpu: 0
 dynhamr_z_min: 0.15
 dynhamr_z_max: 0.4
 dynhamr_gap_fill: 3
+# HMP failure/length skip: validate smooth before replacing WiLoR.
+# Offsets are measured relative to WiLoR 2D points / image diagonal, not GT error.
+dynhamr_smooth_min_retained_ratio: 0.8
+dynhamr_smooth_max_median_offset: 0.05
+dynhamr_smooth_max_p95_offset: 0.15
+dynhamr_smooth_min_visible_ratio: 0.5
 anyhand_focal: 2500
 hand_det_thresh: 0.3
 hand_overlay_points_only: true

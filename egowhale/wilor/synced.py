@@ -46,8 +46,11 @@ def signature(src, config, calibration, camera_mode, confidence, intrinsics_json
                    'Dyn-HaMR/_DATA/hmp_model/results/model/nemf.pth')
     model_ids = {name: identity(thirdparty / name) if (thirdparty / name).is_file() else None for name in model_files}
     code_hash = hashlib.sha256()
-    for p in sorted([*SYNC_ROOT.rglob('*.py'), *SYNC_ROOT.rglob('*.yaml')]):
-        code_hash.update(str(p.relative_to(SYNC_ROOT)).encode())
+    root = SYNC_ROOT.parent
+    code_paths = [*SYNC_ROOT.rglob('*.py'), *SYNC_ROOT.rglob('*.yaml'),
+                  root / 'parallel_stages.py', root / 'pipeline/hmp.py', root / 'synced.py']
+    for p in sorted(code_paths):
+        code_hash.update(str(p.relative_to(root)).encode())
         code_hash.update(p.read_bytes())
     data = {'files': files, 'models': model_ids, 'code': code_hash.hexdigest(), 'camera_mode': camera_mode, 'path': 'b',
             'confidence': confidence, 'backend': 'ego2robot_sync_v1'}
@@ -90,7 +93,6 @@ def convert_output(video, work):
 
 
 def run(src, dst, config, python, camera_mode, calibration, confidence, intrinsics_json=None, runner=None):
-    from egowhale.wilor.step import file_identity, save_prediction
     src, dst = require_mp4(src), Path(dst).resolve()
     video = src
     if calibration or intrinsics_json or camera_mode not in ('auto', 'wilor-default', 'da3'):
@@ -118,6 +120,14 @@ def run(src, dst, config, python, camera_mode, calibration, confidence, intrinsi
         subprocess.run(cmd, env=env, cwd=SYNC_ROOT, check=True)
     else:
         runner(cmd[3:])
+    publish(video, dst, work, run_signature, camera_mode, calibration, confidence, intrinsics_json)
+
+
+def publish(video, dst, work, run_signature, camera_mode='da3', calibration=None,
+            confidence=.3, intrinsics_json=None):
+    from egowhale.wilor.retarget_export import RETARGET_HDF5, export_retarget
+    from egowhale.wilor.step import file_identity, save_prediction
+
     result = convert_output(video, work)
     marker = json.loads((work / 'full_completed.json').read_text())
     metadata = {'signature': run_signature,
@@ -128,7 +138,9 @@ def run(src, dst, config, python, camera_mode, calibration, confidence, intrinsi
                             'confidence': confidence, 'intrinsics_json': str(intrinsics_json) if intrinsics_json else None},
                 'source': 'ego2robot_sync', 'processing_path': marker.get('path'), 'optimization': marker['optimization'],
                 'camera_source': marker['camera_source'], 'overlay': str(work / 'optimized_hand_points.mp4'),
+                'retarget_hdf5': RETARGET_HDF5,
                 'confidence_bbox': 'not provided by reference final output',
                 'keypoints_2d_coordinates': 'original input resolution',
                 'joint_order': 'wrist,thumb,index,middle,ring,little'}
+    export_retarget(Path(dst), result, Path(video), run_signature)
     save_prediction(dst, result, metadata)

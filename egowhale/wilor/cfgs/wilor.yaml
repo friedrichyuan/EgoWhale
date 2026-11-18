@@ -4,15 +4,35 @@
 # 分卡运行：bash scripts/run_wilor_split_multigpu.sh
 # 单视频：bash scripts/wilor.sh /path/video.mp4 [output_dir]
 
-# 分卡调度：DA3 和 WiLoR 使用互不重叠的显卡。
+# 同一视频在独立的 GPU 角色间并行。每张物理 GPU 分给一个角色。
 split:
   input_dir: datasets/egodex_fixed500_18fps
   output_root: outputs/wilor_split_gpu_experiment
-  camera_gpus: [0, 1, 2]
-  wilor_gpus: [3, 4]
-  max_videos: 10           # 0 表示全部；先用少量视频测试
-  max_pending_camera: 4    # DA3 完成、等待 WiLoR 的队列容量
+  profiles:
+    basic:
+      camera_gpus: [0, 1, 2]
+      wilor_gpus: [3, 4, 5]
+    refined:
+      camera_gpus: [0]
+      wilor_gpus: [1]
+      mask_gpus: [2]
+      optimizer_gpus: [3, 4]
+  max_videos: 0
+  max_inflight_videos: 5
+  max_inflight_source_bytes: 1073741824  # 在途视频源文件合计，0 为关闭
+  max_pending_hmp_per_video: 4
+  prepare_workers: 2
+  postprocess_workers: 2
+  write_workers: 2
   heartbeat_seconds: 10
+
+long_video:
+  da3_max_views: 128          # 0 为关闭视图上限，抽帧仍受 depth_stride 控制
+  da3_retry_views: [64, 32]  # CUDA OOM 时依次降低预算
+  sam3_max_frames: 256        # 每窗保留最多 256 帧，窗口之间有重叠
+  sam3_retry_frames: [128, 64]
+  hmp_overlap: 16             # 固定 128 帧窗口中的重叠长度
+save_depth_maps: false        # 手部节点只依赖相机参数，按需保留全尺寸深度图
 
 # 手部模型与处理参数。长视频 depth_stride=1 可能导致 DA3 显存不足；
 # 增大该值会采样帧并插值，结果与全帧推理可能不同。
@@ -41,6 +61,7 @@ dynhamr_smooth_max_p95_offset: 0.15
 dynhamr_smooth_min_visible_ratio: 0.5
 anyhand_focal: 2500
 hand_det_thresh: 0.3
+min_hand_detection_rate: 0.10  # 关闭时序优化时每只手的最低有效帧比例
 hand_overlay_points_only: true
 sam3_checkpoint: thirdparty/sam3/checkpoints/sam3.pt
 depth_model: da3giant

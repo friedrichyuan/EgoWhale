@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 先在 egowhale/wilor/cfgs/wilor.yaml 中修改分卡、数据集和视频数。
+# 独立 WiLoR 多卡入口。默认处理 egodex_fixed500_18fps 下的所有 MP4。
+# dynhamr_enabled 选择 split.profiles.basic 或 split.profiles.refined。
+# --dry-run 仅检查配置，--max-videos N 限制条数，--resume-run DIR 续跑。
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"

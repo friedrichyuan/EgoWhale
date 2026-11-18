@@ -21,23 +21,19 @@ class SyncedNodeTests(unittest.TestCase):
     def test_unmodified_modules_and_base_config_match_reference(self):
         # EgoWhale intentionally extends hand_processor/run_dynhamr with validated
         # smooth fallback; those branches are exercised in test_wilor_smooth_fallback.
-        for relative in ('ego2robot/processors/depth_pose_processor.py',
-                         'ego2robot/models/anyhand_wrapper.py', 'ego2robot/models/wilor_wrapper.py',
+        # DA3 sampling and AnyHand candidate extraction are now WiLoR-specific adapters.
+        for relative in ('ego2robot/models/wilor_wrapper.py',
                          'ego2robot/models/da3_wrapper.py', 'ego2robot/utils/legacy_mano.py',
                          'ego2robot/utils/progress.py',
                          ):
             with self.subTest(file=relative):
                 actual = (synced.SYNC_ROOT / relative).read_text()
                 expected = (REFERENCE / relative).read_text()
-                # Resident workers reuse weights; only the progress message differs.
-                actual = actual.replace('message=f"读取 {T} 帧，" + ("加载 DA3 模型" if self._model is None else "复用 DA3 模型")',
-                                        'message=f"读取 {T} 帧，加载 DA3 模型"')
-                actual = actual.replace('message="加载 AnyHand/WiLoR 权重" if self._predictor is None else "复用 AnyHand/WiLoR 模型"',
-                                        'message="加载 AnyHand/WiLoR 权重"')
                 self.assertEqual(actual, expected)
         import yaml
         config = yaml.safe_load(synced.CONFIG.read_text())
-        hand_config = {k: v for k, v in config.items() if k not in ('split', 'resident', 'legacy')}
+        local_overrides = ('split', 'resident', 'legacy', 'long_video', 'save_depth_maps', 'min_hand_detection_rate')
+        hand_config = {k: v for k, v in config.items() if k not in local_overrides}
         self.assertEqual(hand_config, yaml.safe_load((synced.SYNC_ROOT / 'configs/hand_experiment.yaml').read_text()))
         base = {k: v for k, v in hand_config.items() if not k.startswith('dynhamr_smooth_')}
         self.assertEqual(base, yaml.safe_load((REFERENCE / 'configs/hand_experiment.yaml').read_text()))

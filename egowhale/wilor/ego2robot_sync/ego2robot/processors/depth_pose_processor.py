@@ -19,6 +19,17 @@ from ego2robot.utils.progress import report_progress
 logger = logging.getLogger(__name__)
 
 
+def da3_frame_indices(count, stride=1, cap=0):
+    if count < 1 or stride < 1 or cap < 0 or cap == 1:
+        raise ValueError("Invalid DA3 sampling budget")
+    indices = list(range(0, count, stride))
+    if indices[-1] != count - 1:
+        indices.append(count - 1)
+    if cap and len(indices) > cap:
+        indices = [indices[i] for i in np.linspace(0, len(indices) - 1, cap).round().astype(int)]
+    return indices
+
+
 @register_processor("depth_pose")
 class DepthPoseProcessor(BaseProcessor):
     """Estimate depth, camera pose, and intrinsics using DA3.
@@ -55,64 +66,53 @@ class DepthPoseProcessor(BaseProcessor):
         # ── Standardize video filename ───────────────────
         self._ensure_standard_video(data_sub_folder)
 
-        # ── Load video frames ────────────────────────────
-        frames_rgb, fps = self._load_frames(data_sub_folder)
-        if frames_rgb is None or len(frames_rgb) == 0:
-            raise ValueError(f"No video frames found in {data_sub_folder}")
-
-        T, H, W = len(frames_rgb), frames_rgb[0].shape[0], frames_rgb[0].shape[1]
-        logger.info(f"[depth_pose] {T} frames, {W}x{H}, fps={fps}")
-        report_progress("DA3 相机估计", message=f"读取 {T} 帧，" + ("加载 DA3 模型" if self._model is None else "复用 DA3 模型"))
-
-        # ── Run DA3 (with optional stride to reduce memory) ──
-        self._ensure_model()
-        depth_stride = self.cfg.get("depth_stride", 1)
-        stride_indices = list(range(T))
-        if depth_stride > 1 and T > depth_stride:
-            stride_indices = list(range(0, T, depth_stride))
-            if stride_indices[-1] != T - 1:
-                stride_indices.append(T - 1)
-            stride_frames = [frames_rgb[i] for i in stride_indices]
-            logger.info(f"[depth_pose] depth_stride={depth_stride}: {len(stride_frames)}/{T} frames to DA3")
-            report_progress("DA3 相机估计", message=f"推理 {len(stride_frames)} 个采样帧；推理期间显示耗时，不估算百分比")
-            result = self._model.predict(stride_frames, process_res=self.cfg.get("da3_process_res", 504))
-
-            # Interpolate depth for skipped frames
-            stride_depths = []
-            for i in range(len(stride_indices)):
-                d = result["depth"][i]
-                if d.shape != (H, W):
-                    d = cv2.resize(d, (W, H), interpolation=cv2.INTER_LINEAR)
-                stride_depths.append(d)
-            all_depths = np.zeros((T, H, W), dtype=np.float32)
-            for j in range(len(stride_indices) - 1):
-                i0, i1 = stride_indices[j], stride_indices[j + 1]
-                all_depths[i0] = stride_depths[j]
-                for k in range(i0 + 1, i1):
-                    alpha = (k - i0) / (i1 - i0)
-                    all_depths[k] = stride_depths[j] * (1 - alpha) + stride_depths[j + 1] * alpha
-            all_depths[stride_indices[-1]] = stride_depths[-1]
+        stride = int(self.cfg.get("depth_stride", 1))
+        cap = int(self.cfg.get("da3_max_views", 0))
+        prepared = save_dir / "input.json"
+        if prepared.is_file() and (save_dir / "video_L.mp4").is_file():
+            import av
+            info = json.loads(prepared.read_text())
+            T, fps = info["frames"], info["fps"]
+            W, H = info["size"]
+            indices = da3_frame_indices(T, stride, cap)
+            selected = set(indices)
+            with av.open(str(save_dir / "video_L.mp4")) as video:
+                frames = [frame.to_ndarray(format="rgb24") for i, frame in enumerate(video.decode(video=0))
+                          if i in selected]
+            if len(frames) != len(indices):
+                raise ValueError("DA3 采样帧与准备阶段不一致")
         else:
-            report_progress("DA3 相机估计", message=f"推理全部 {T} 帧")
-            result = self._model.predict(frames_rgb, process_res=self.cfg.get("da3_process_res", 504))
-            all_depths = np.zeros((T, H, W), dtype=np.float32)
-            for i in range(T):
-                depth_i = result["depth"][i]
-                if depth_i.shape != (H, W):
-                    depth_i = cv2.resize(depth_i, (W, H), interpolation=cv2.INTER_LINEAR)
-                all_depths[i] = depth_i
+            frames, fps = self._load_frames(data_sub_folder)
+            if not frames:
+                raise ValueError(f"No video frames found in {data_sub_folder}")
+            T, (H, W) = len(frames), frames[0].shape[:2]
+            indices = da3_frame_indices(T, stride, cap)
+            frames = [frames[i] for i in indices]
 
-        # ── Save depth maps ──────────────────────────────
+        stride_indices = indices
+        report_progress("DA3 相机估计", message=f"推理 {len(frames)}/{T} 帧")
+        self._ensure_model()
+        result = self._model.predict(frames, process_res=self.cfg.get("da3_process_res", 504))
+        (save_dir / "da3_samples.json").write_text(json.dumps({"indices": indices, "max_views": cap}))
         depth_dir = save_dir / "depth"
         depth_dir.mkdir(exist_ok=True)
-
-        # Single bulk file (fast read for downstream stages)
         if self.cfg.get("save_depth_maps", True):
-            np.save(str(depth_dir / "all_depths.npy"), all_depths)
-
-            # Also per-frame (uncompressed np.save -- 10x faster than savez_compressed)
+            depths = [cv2.resize(d, (W, H), interpolation=cv2.INTER_LINEAR)
+                      if d.shape != (H, W) else d for d in result["depth"]]
+            bulk = np.lib.format.open_memmap(depth_dir / "all_depths.npy", mode="w+",
+                                            dtype=np.float32, shape=(T, H, W))
+            j = 0
             for i in range(T):
-                np.save(str(depth_dir / f"{i:06d}.npy"), all_depths[i])
+                if j + 1 < len(indices) and i == indices[j + 1]:
+                    j += 1
+                if i == indices[j]:
+                    depth = depths[j]
+                else:
+                    alpha = (i - indices[j]) / (indices[j + 1] - indices[j])
+                    depth = depths[j] * (1 - alpha) + depths[j + 1] * alpha
+                bulk[i] = depth
+                np.save(depth_dir / f"{i:06d}.npy", bulk[i])
+            del bulk
         report_progress("DA3 相机参数保存", message="保存估计的内参与位姿")
 
         # ── Save camera extrinsics ───────────────────────

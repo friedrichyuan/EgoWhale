@@ -98,6 +98,14 @@ class HandProcessor(BaseProcessor):
         result = self._wrapper.predict(frames_rgb, focal_length=focal,
                                        img_center=(cx, cy))
 
+        self.save_basic(result, save_dir, fx, fy, cx, cy, T, H, W, fps)
+        # ── Generate hand skeleton overlay video ─────────
+        self._save_hand_overlay_video(frames_rgb, save_dir, focal, H, W, fps=fps)
+
+        logger.info(f"[hand] saved to {save_dir}")
+
+    def save_basic(self, result, save_dir, fx, fy, cx, cy, T, H, W, fps):
+        focal = (fx + fy) / 2.0
         # ── Save hand data ────────────────────────────────
         min_detection_rate = self.cfg.get("min_hand_detection_rate", 0.3)
 
@@ -185,11 +193,6 @@ class HandProcessor(BaseProcessor):
                 detected_frame_ids=hand['frame_ids'],
             )
 
-        # ── Generate hand skeleton overlay video ─────────
-        self._save_hand_overlay_video(frames_rgb, save_dir, focal, H, W, fps=fps)
-
-        logger.info(f"[hand] saved to {save_dir}")
-
     def _filter_hand_jumps(self, hand_detected, kpts_3d, kpts_2d, eef_rot, hand_name, T, fps=30.0, focal=500.0):
         """Iterative jump filtering + short segment removal.
 
@@ -257,7 +260,7 @@ class HandProcessor(BaseProcessor):
                         f"(jumps + short segments), remaining {hand_detected.sum()}/{T}")
         return hand_detected, n_filtered
 
-    def _save_hand_overlay_video(self, frames_rgb, save_dir, focal, H, W, suffix="", data_prefix="hand_data", fps=30.0):
+    def _save_hand_overlay_video(self, frames_rgb, save_dir, focal, H, W, suffix="", data_prefix="hand_data", fps=30.0, frame_count=None):
         """Draw detected 3D hand joints projected onto video frames.
 
         Output: hand_processor/video_hand_overlay.mp4 (H.264, viewable in VSCode)
@@ -282,7 +285,7 @@ class HandProcessor(BaseProcessor):
         if not hands:
             return
 
-        T = len(frames_rgb)
+        T = len(frames_rgb) if frame_count is None else frame_count
         status = getattr(self, "optimization_status", {})
         overlay_stage = ("优化前标注视频" if suffix else
                          "smooth 优化后标注视频" if status.get("result_source") == "smooth_fit" else
@@ -300,63 +303,61 @@ class HandProcessor(BaseProcessor):
         ]
         COLORS = {'right': (0, 220, 0), 'left': (220, 0, 220)}  # green / magenta
 
-        overlay_frames = []
-        for t in range(T):
-            frame = frames_rgb[t].copy()
-
-            for side in ['left', 'right']:
-                if side not in hands:
-                    continue
-                detected = hands[side]['detected'][t]
-                kpts = hands[side]['kpts_2d'][t]  # (21, 2)
-
-                if detected and np.any(kpts > 0):
-                    color = COLORS[side]
-                    # Draw bones
-                    for i, j in ([] if points_only else BONES):
-                        p1 = (int(kpts[i, 0]), int(kpts[i, 1]))
-                        p2 = (int(kpts[j, 0]), int(kpts[j, 1]))
-                        if 0 < p1[0] < W and 0 < p1[1] < H and 0 < p2[0] < W and 0 < p2[1] < H:
-                            cv2.line(frame, p1, p2, color, 1, cv2.LINE_AA)
-                    # Draw joints
-                    for k in range(21):
-                        px = (int(kpts[k, 0]), int(kpts[k, 1]))
-                        if 0 < px[0] < W and 0 < px[1] < H:
-                            cv2.circle(frame, px, 2, color, -1)
-                    # Wrist label
-                    wx, wy = int(kpts[0, 0]), int(kpts[0, 1])
-                    if not points_only and 0 < wx < W and 0 < wy < H:
-                        cv2.putText(frame, side[0].upper(), (wx + 5, wy - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1, cv2.LINE_AA)
-
-            # Detection status text
-            status_parts = []
-            for side in ['left', 'right']:
-                if side in hands:
-                    det = hands[side]['detected'][t]
-                    tag = f"{side[0].upper()}:{'OK' if det else '--'}"
-                    status_parts.append(tag)
-            status = "  ".join(status_parts)
-            if not points_only:
-                cv2.putText(frame, status, (5, H - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(frame, f"f{t}", (W - 30, H - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1, cv2.LINE_AA)
-
-            overlay_frames.append(frame)
-            if (t + 1) % 30 == 0 or t + 1 == T:
-                report_progress(overlay_stage, t + 1, T)
-
-        # Save as H.264 MP4
         out_path = str(save_dir / f"video_hand_overlay{suffix}.mp4")
-        h, w = overlay_frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(out_path + ".tmp.mp4", fourcc, fps, (w, h))
+        writer = cv2.VideoWriter(out_path + ".tmp.mp4", cv2.VideoWriter_fourcc(*'mp4v'), fps, (W, H))
         if not writer.isOpened():
             raise RuntimeError(f"Cannot open video writer: {out_path}")
-        for f in overlay_frames:
-            writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-        writer.release()
+        count = 0
+        try:
+            for t, rgb in enumerate(frames_rgb):
+                frame = rgb.copy()
+                for side in ['left', 'right']:
+                    if side not in hands:
+                        continue
+                    detected = hands[side]['detected'][t]
+                    kpts = hands[side]['kpts_2d'][t]  # (21, 2)
+
+                    if detected and np.any(kpts > 0):
+                        color = COLORS[side]
+                        # Draw bones
+                        for i, j in ([] if points_only else BONES):
+                            p1 = (int(kpts[i, 0]), int(kpts[i, 1]))
+                            p2 = (int(kpts[j, 0]), int(kpts[j, 1]))
+                            if 0 < p1[0] < W and 0 < p1[1] < H and 0 < p2[0] < W and 0 < p2[1] < H:
+                                cv2.line(frame, p1, p2, color, 1, cv2.LINE_AA)
+                        # Draw joints
+                        for k in range(21):
+                            px = (int(kpts[k, 0]), int(kpts[k, 1]))
+                            if 0 < px[0] < W and 0 < px[1] < H:
+                                cv2.circle(frame, px, 2, color, -1)
+                        # Wrist label
+                        wx, wy = int(kpts[0, 0]), int(kpts[0, 1])
+                        if not points_only and 0 < wx < W and 0 < wy < H:
+                            cv2.putText(frame, side[0].upper(), (wx + 5, wy - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1, cv2.LINE_AA)
+
+                # Detection status text
+                status_parts = []
+                for side in ['left', 'right']:
+                    if side in hands:
+                        det = hands[side]['detected'][t]
+                        tag = f"{side[0].upper()}:{'OK' if det else '--'}"
+                        status_parts.append(tag)
+                status = "  ".join(status_parts)
+                if not points_only:
+                    cv2.putText(frame, status, (5, H - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, f"f{t}", (W - 30, H - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1, cv2.LINE_AA)
+
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                count += 1
+                if count % 30 == 0 or count == T:
+                    report_progress(overlay_stage, count, T)
+        finally:
+            writer.release()
+        if count != T:
+            raise ValueError(f"标注视频帧数不一致：{count} != {T}")
 
         # Transcode to H.264 for VSCode compatibility
         try:
@@ -454,10 +455,6 @@ class HandProcessor(BaseProcessor):
                 f"[dynhamr] Raw checkpoint not found in {save_dir}. Run hand_detect first."
             )
 
-        predictor = self._wrapper._predictor
-        if predictor is None:
-            self._wrapper._ensure_loaded()
-            predictor = self._wrapper._predictor
         sam3_path = self.cfg.get("sam3_hand_masks")
         if not sam3_path:
             sam3_path = os.path.join(data_sub_folder, "hand_masks", "hand_masks.npy")
@@ -470,24 +467,23 @@ class HandProcessor(BaseProcessor):
         if sam3_masks is not None:
             logger.info(f"[hand] SAM3 masks: {sam3_masks.shape}")
 
-        # Step 1: Per-frame detection with SAM3 + edge filter
-        report_progress("WiLoR 逐帧预测", 0, T)
+        self.save_tracks(self._wrapper.candidates(frames_rgb, T), sam3_masks, save_dir, T, H, W)
+
+        if self.cfg.get("save_raw_overlay", True):
+            self._save_hand_overlay_video(frames_rgb, save_dir, (fx + fy) / 2.0, H, W,
+                                          suffix="_anyhand", data_prefix="hand_data_raw", fps=fps)
+        if hand_mode == "detect_only":
+            logger.info("[hand_detect] Detection complete, skipping DynHaMR")
+            return
+        self._run_dynhamr_refinement(data_sub_folder, save_dir, fx, fy, cx, cy, T, H, W, frames_rgb)
+        self._save_hand_overlay_video(frames_rgb, save_dir, (fx + fy) / 2.0, H, W, fps=fps)
+
+    def save_tracks(self, candidates, sam3_masks, save_dir, T, H, W):
+        """Filter all per-frame candidates and write the official bidirectional tracks."""
+        hand_mode = self.cfg.get("hand_mode", "full")
         all_dets = {}
         n_edge, n_sam3 = 0, 0
-        for t in range(T):
-            if t % 30 == 0:
-                report_progress("WiLoR 逐帧预测", t, T)
-            if t % 100 == 0:
-                logger.info(f"[hand] detecting {t}/{T}...")
-            img_bgr = cv2.cvtColor(frames_rgb[t], cv2.COLOR_RGB2BGR)
-            boxes, is_right, scores = predictor._detect_hands(img_bgr)
-            if len(boxes) == 0:
-                continue
-            for i in range(len(boxes)):
-                is_right[i] = (boxes[i][0] + boxes[i][2]) / 2.0 >= W / 2.0
-            run_fn = predictor._run_wilor if self.cfg.get("anyhand_backend", "wilor") == "wilor" else predictor._run_hamer
-            hands = run_fn(img_bgr, boxes, is_right, scores)
-
+        for t, hands in enumerate(candidates):
             mask = sam3_masks[t] if sam3_masks is not None and t < len(sam3_masks) else None
             if sam3_masks is not None and (mask is None or not mask.any()):
                 continue
@@ -500,6 +496,8 @@ class HandProcessor(BaseProcessor):
                 kp2d[:, 0] = jc[:, 0] / jc[:, 2] * pf + W / 2.0
                 kp2d[:, 1] = jc[:, 1] / jc[:, 2] * pf + H / 2.0
 
+                if not np.isfinite(kp2d).all():
+                    continue
                 if mask is not None:
                     n_in_mask = sum(1 for k in range(21)
                                    if 0 <= int(kp2d[k, 0]) < W and 0 <= int(kp2d[k, 1]) < H
@@ -524,7 +522,6 @@ class HandProcessor(BaseProcessor):
                 all_dets[t] = frame_dets
 
         logger.info(f"[hand] SAM3 filtered: {n_sam3}, edge filtered: {n_edge}")
-        report_progress("WiLoR 逐帧预测", T, T)
 
         # Step 2: Score-based tracking
         report_progress("跨帧跟踪与异常过滤")
@@ -633,21 +630,6 @@ class HandProcessor(BaseProcessor):
                     projection_focals=projection_focals,
                 )
 
-        # Step 5: Save AnyHand overlay (before DynHaMR)
-        if self.cfg.get("save_raw_overlay", True):
-            self._save_hand_overlay_video(frames_rgb, save_dir, (fx + fy) / 2.0, H, W,
-                                          suffix="_anyhand", data_prefix="hand_data_raw", fps=fps)
-
-        if hand_mode == "detect_only":
-            logger.info("[hand_detect] Detection complete, skipping DynHaMR")
-            return
-
-        # Step 6: DynHaMR temporal refinement
-        self._run_dynhamr_refinement(data_sub_folder, save_dir, fx, fy, cx, cy, T, H, W, frames_rgb)
-
-        # Step 7: Generate overlay (after DynHaMR)
-        self._save_hand_overlay_video(frames_rgb, save_dir, (fx + fy) / 2.0, H, W, fps=fps)
-
     def _run_dynhamr_refinement(self, data_sub_folder, save_dir, fx, fy, cx, cy, T, H, W, frames_rgb):
         """Run DynHaMR temporal optimization on AnyHand per-frame results."""
 
@@ -722,7 +704,7 @@ class HandProcessor(BaseProcessor):
         (Path(data_sub_folder) / "optimization_status.json").write_text(json.dumps(self.optimization_status, indent=2))
 
     def _try_smooth_fallback(self, dynhamr_root, dh_test_dir, seq_name, save_dir,
-                             fx, fy, cx, cy, T, H, W, gap_fill, z_min, z_max):
+                             fx, fy, cx, cy, T, H, W, gap_fill, z_min, z_max, *, frame_start=None):
         """Validate a completed smooth result before replacing any WiLoR files."""
         from ego2robot.utils.optimization_quality import assess_smooth_result
         report_progress("smooth 结果质量检查")
@@ -741,7 +723,7 @@ class HandProcessor(BaseProcessor):
             candidate = self._postprocess_dynhamr(
                 dynhamr_root, dh_test_dir, seq_name, save_dir,
                 fx, fy, cx, cy, T, gap_fill, z_min, z_max,
-                result_path=source, write_output=False)
+                result_path=source, write_output=False, **({} if frame_start is None else {"frame_start": frame_start}))
             quality = assess_smooth_result(baseline, candidate, T, W, H, self.cfg)
             quality["source_file"] = str(source)
             if quality["accepted"]:
@@ -759,8 +741,9 @@ class HandProcessor(BaseProcessor):
         img_dir = os.path.join(dh_test_dir, "images", seq_name)
         os.makedirs(img_dir, exist_ok=True)
         for i, frame in enumerate(frames_rgb):
-            cv2.imwrite(os.path.join(img_dir, f"{i:06d}.jpg"),
-                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            if not cv2.imwrite(os.path.join(img_dir, f"{i:06d}.jpg"),
+                               cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)):
+                raise OSError(f"Could not write DynHaMR frame {i}")
         return img_dir
 
     def _convert_to_dynhamr(self, save_dir, dh_test_dir, seq_name,
@@ -923,7 +906,7 @@ class HandProcessor(BaseProcessor):
 
     def _postprocess_dynhamr(self, dynhamr_root, dh_test_dir, seq_name, save_dir,
                               fx, fy, cx, cy, T, gap_fill, z_min, z_max,
-                              *, result_path=None, write_output=True):
+                              *, result_path=None, write_output=True, frame_start=None):
         """Build hand arrays from prior or smooth, optionally publishing them."""
         import torch
         import sys
@@ -975,7 +958,7 @@ class HandProcessor(BaseProcessor):
             frames = set(int(f.split('_')[0]) for f in os.listdir(td) if '_mano.json' in f)
             det_per_tid[tid] = frames
             all_frames.update(frames)
-        start_frame = min(all_frames) if all_frames else 0
+        start_frame = (min(all_frames) if all_frames else 0) if frame_start is None else frame_start
         if start_frame < 0 or start_frame + T_dh > T:
             raise ValueError("optimized frames do not fit the video timeline")
 
@@ -1097,43 +1080,8 @@ class HandProcessor(BaseProcessor):
         ckpt = self.cfg.get("sam3_checkpoint", "")
         script = f"""
 import numpy as np
-from PIL import Image as PILImage
-from sam3.model_builder import build_sam3_video_predictor
-from ego2robot.utils.progress import report_progress
-import cv2
-
-frames_rgb = np.load({frames_path!r})
-T, H, W = frames_rgb.shape[:3]
-ckpt = {ckpt!r}
-report_progress("SAM3 手部掩码", 0, T, "加载模型")
-predictor = build_sam3_video_predictor(checkpoint_path=ckpt, gpus_to_use=[0]) if ckpt else build_sam3_video_predictor(gpus_to_use=[0])
-pil_frames = [PILImage.fromarray(frames_rgb[i]) for i in range(T)]
-resp = predictor.handle_request(dict(type="start_session", resource_path=pil_frames))
-sid = resp["session_id"]
-try:
-    resp = predictor.handle_request(dict(type="add_prompt", session_id=sid, frame_index=T//2, text="hand"))
-    n = len(resp["outputs"].get("out_obj_ids", []))
-    print(f"SAM3 hand mask: frame {{T//2}} detected {{n}} objects")
-    if n == 0:
-        for ff in [0, T//4, 3*T//4, T-1]:
-            resp = predictor.handle_request(dict(type="add_prompt", session_id=sid, frame_index=ff, text="hand"))
-            if len(resp["outputs"].get("out_obj_ids", [])) > 0: break
-    masks = np.zeros((T, H, W), dtype=bool)
-    seen = set()
-    for resp in predictor.handle_stream_request(dict(type="propagate_in_video", session_id=sid)):
-        fi = resp["frame_index"]
-        seen.add(fi)
-        if len(seen) % 30 == 0 or len(seen) == T:
-            report_progress("SAM3 手部掩码", len(seen), T)
-        om = resp["outputs"].get("out_binary_masks")
-        if om is not None and hasattr(om, 'any'):
-            m = om.any(dim=0).cpu().numpy() if hasattr(om, 'cpu') else np.asarray(om).any(axis=0)
-            if m.shape != (H, W): m = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
-            masks[fi] = m
-finally:
-    predictor.handle_request(dict(type="close_session", session_id=sid))
-np.save({save_path!r}, masks)
-print(f"Saved: {{masks.any(axis=(1,2)).sum()}}/{{T}} frames")
+from ego2robot.processors.wilor_masks import build_predictor, propagate_masks
+propagate_masks(build_predictor({ckpt!r}), np.load({frames_path!r}, mmap_mode="r"), {str(save_path)!r})
 """
         logger.info("[hand] Generating SAM3 hand masks in subprocess...")
         report_progress("SAM3 手部掩码", 0, len(frames_rgb))

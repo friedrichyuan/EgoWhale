@@ -80,11 +80,91 @@ def install_hmp_fallback(fitting, status_path):
     fitting.run_prior = optional_prior
 
 
+def checkpoint_prior(fitting, output):
+    """Save exactly the prior inputs supplied after the upstream smooth stage."""
+    import numpy as np
+    from omegaconf import OmegaConf
+
+    def save(cfg, dataset, out_dir, device, phases, obs_data, hand_model, opt, data_args, prior_out, save_dir=None):
+        paths = sorted((Path(out_dir) / "smooth_fit").glob(f"{dataset.seq_name}_*_world_results.npz"))
+        if not paths:
+            raise FileNotFoundError("DynHaMR did not produce smooth output")
+        if Path(out_dir).resolve() != output:
+            raise ValueError("Unexpected DynHaMR output root")
+        np.savez(output / "observations.npz", **{
+            key: obs_data[key].detach().cpu().numpy() for key in ("joints2d", "vis_mask", "is_right")
+        })
+        (output / "hmp_config.yaml").write_text(OmegaConf.to_yaml(opt, resolve=True))
+        (output / "smooth_completed.json").write_text(json.dumps({
+            "smooth_result": str(paths[-1].resolve()),
+            "frames": int(dataset.seq_len),
+            "frame_start": int(dataset.data_start + dataset.start_idx),
+            "tracks": [str(t) for t in dataset.track_ids],
+        }))
+
+    fitting.run_prior = save
+
+
+def run_hmp_window(checkpoint, output, side, start, stop):
+    """Read a smooth checkpoint and run only the selected prior window."""
+    import numpy as np
+    import torch
+    from types import SimpleNamespace
+    from body_model import MANO
+    from HMP.fitting import run_prior
+    from omegaconf import OmegaConf
+
+    status = json.loads((checkpoint / "smooth_completed.json").read_text())
+    count = status["frames"]
+    if not 0 <= start < stop <= count or stop - start > 128:
+        raise ValueError("Invalid HMP window")
+    with np.load(status["smooth_result"]) as data:
+        base = dict(data)
+    with np.load(checkpoint / "observations.npz") as data:
+        obs = dict(data)
+    if side < 0 and (start, stop, count) != (0, 128, 128):
+        raise ValueError("Full prior requires 128 frames")
+    hands = base["trans"].shape[0]
+    if side >= hands:
+        raise ValueError("Invalid HMP hand")
+    if side >= 0:
+        indices = np.minimum(np.arange(start, start + 128), stop - 1)
+        for key, value in base.items():
+            if key == "betas":
+                base[key] = value[side:side + 1]
+            elif value.shape[:2] == (hands, count):
+                base[key] = value[side:side + 1, indices]
+        obs = {key: value[side:side + 1, indices] for key, value in obs.items()}
+        obs["joints2d"][:, stop - start:, ..., 2] = 0
+        obs["vis_mask"][:, stop - start:] = 0
+
+    cfg = OmegaConf.load(checkpoint / "hmp_config.yaml")
+    device = torch.device("cuda:0")
+    model = MANO(batch_size=128, pose2rot=True,
+                 **{key.lower(): value for key, value in cfg.MANO.items()}).to(device)
+    smooth, prior = output / "smooth_fit", output / "prior"
+    smooth.mkdir(parents=True)
+    prior.mkdir()
+    seq = cfg.data.seq
+    np.savez(smooth / f"{seq}_000000_world_results.npz", **base)
+    run_prior(cfg, SimpleNamespace(seq_name=seq), str(output), device, ["smooth_fit"],
+              {key: torch.from_numpy(value) for key, value in obs.items()},
+              model, cfg, cfg.data, str(prior))
+    result = list(prior.glob("*_world_results.npz"))
+    if len(result) != 1:
+        raise RuntimeError("HMP did not produce exactly one result")
+    result[0].replace(output / "result.npz")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dynhamr-root", type=Path, default=ROOT / "thirdparty/Dyn-HaMR")
     parser.add_argument("--check-import", action="store_true")
     parser.add_argument("--hmp-fallback-status", type=Path)
+    parser.add_argument("--prepare-hmp", type=Path)
+    parser.add_argument("--hmp-checkpoint", type=Path)
+    parser.add_argument("--hmp-output", type=Path)
+    parser.add_argument("--hmp-window", type=int, nargs=3, metavar=("HAND", "START", "STOP"))
     args, overrides = parser.parse_known_args()
     source = args.dynhamr_root.resolve() / "dyn-hamr"
     if not (source / "run_opt.py").is_file():
@@ -103,6 +183,11 @@ def main():
     from loguru import logger
     logger.remove()
     logger.add(sys.stderr, level="WARNING")
+    if args.hmp_checkpoint:
+        run_hmp_window(args.hmp_checkpoint, args.hmp_output, *args.hmp_window)
+        return 0
+    if args.prepare_hmp:
+        checkpoint_prior(importlib.import_module("HMP.fitting"), args.prepare_hmp)
     if args.hmp_fallback_status:
         install_hmp_fallback(importlib.import_module("HMP.fitting"), args.hmp_fallback_status.resolve())
     install_static_camera_intrinsics(importlib.import_module("data.dataset").CameraData)

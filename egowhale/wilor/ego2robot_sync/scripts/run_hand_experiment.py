@@ -50,7 +50,7 @@ def check_da3_import():
 def check_requirements(cfg, camera_source, stage, needs_hand=True):
     errors = []
     use_optimizer = needs_hand and bool(cfg.get("dynhamr_enabled", False)) and stage != "detect"
-    main_modules = ["torch", "cv2", "av", "omegaconf", "natsort", "mediapy", "IPython", "scipy", "smplx", "chumpy"]
+    main_modules = ["torch", "cv2", "av", "h5py", "omegaconf", "natsort", "mediapy", "IPython", "scipy", "smplx", "chumpy"]
     if use_optimizer:
         main_modules += ["tensorboard", "human_body_prior"]
     if needs_hand and stage != "refine":
@@ -305,8 +305,13 @@ def main(argv=None, resident=None):
         processor = HandProcessor(cfg)
         processor.process_one_demo(str(output))
         optimization = getattr(processor, "optimization_status", {'result_source': 'wilor', 'fallback': False})
+    return finish(output, args.stage, path_mode, camera_source, optimization)
+
+
+def finish(output, stage, path_mode, camera_source, optimization, expected_frames=None):
+    marker = output / f"{stage}_completed.json"
     final_video = None
-    if args.stage != "detect":
+    if stage != "detect":
         final_video = output / "optimized_hand_points.mp4"
         source_video = output / "hand_processor/video_hand_overlay.mp4"
         if not source_video.is_file() or source_video.stat().st_size == 0:
@@ -318,6 +323,10 @@ def main(argv=None, resident=None):
             if decoded_frame is None:
                 raise RuntimeError("优化后标注视频没有可解码的帧")
             frame_width, frame_height = decoded_frame.width, decoded_frame.height
+            if expected_frames is not None:
+                count = 1 + sum(1 for _ in container.decode(video=0)) if not container.streams.video[0].frames else container.streams.video[0].frames
+                if count != expected_frames:
+                    raise ValueError(f"标注视频帧数不匹配：{count} != {expected_frames}")
         annotated_frames = {}
         for side in ("left", "right"):
             with np.load(output / "hand_processor" / f"hand_data_{side}.npz") as data:
@@ -330,7 +339,7 @@ def main(argv=None, resident=None):
         if not any(annotated_frames.values()):
             print("提示：两只手都没有有效标注点，视频仍按官方行为输出", flush=True)
         shutil.copy2(source_video, final_video)
-    marker.write_text(json.dumps({"stage": args.stage, "path": path_mode, "camera_source": camera_source,
+    marker.write_text(json.dumps({"stage": stage, "path": path_mode, "camera_source": camera_source,
                                   "optimized_video": str(final_video) if final_video else None,
                                   "optimization": optimization}, ensure_ascii=False, indent=2))
     report_progress("完成", message=str(final_video or output / "hand_processor"))

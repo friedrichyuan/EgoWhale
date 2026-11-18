@@ -137,6 +137,31 @@ class StageSelectionTests(unittest.TestCase):
             self.assertFalse((root / 'hmp_running.json').exists())
             self.assertTrue(json.loads((root / 'smooth_completed.json').read_text())['root_smooth_completed'])
 
+    def test_split_checkpoint_accepts_dynhamr_prior_arguments(self):
+        from omegaconf import OmegaConf
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            smooth = root / 'smooth_fit'
+            smooth.mkdir()
+            result = smooth / 'episode_000300_world_results.npz'
+            np.savez(result, value=300)
+            fitting = SimpleNamespace()
+            launcher.checkpoint_prior(fitting, root)
+            dataset = SimpleNamespace(seq_name='episode', seq_len=128, data_start=2, start_idx=3, track_ids=['001'])
+            value = Mock()
+            value.detach.return_value.cpu.return_value.numpy.return_value = np.ones((1, 128))
+            observations = dict.fromkeys(('joints2d', 'vis_mask', 'is_right'), value)
+            cfg = OmegaConf.create({'data': {'seq': 'episode'}})
+            fitting.run_prior(cfg, dataset, root, 'cuda:0', ['smooth_fit'], observations,
+                              None, cfg, cfg.data, root / 'prior')
+            marker = json.loads((root / 'smooth_completed.json').read_text())
+            self.assertEqual(marker, {'smooth_result': str(result), 'frames': 128,
+                                      'frame_start': 5, 'tracks': ['001']})
+            with np.load(root / 'observations.npz', allow_pickle=False) as saved:
+                self.assertEqual(set(saved.files), set(observations))
+                np.testing.assert_array_equal(saved['vis_mask'], np.ones((1, 128)))
+
     def test_smooth_is_published_only_after_acceptance(self):
         for valid in (True, False):
             with self.subTest(valid=valid), tempfile.TemporaryDirectory() as directory:

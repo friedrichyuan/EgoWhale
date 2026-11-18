@@ -36,6 +36,13 @@ def main():
                 request = json.loads(line)
                 if request.get('command') == 'stop':
                     break
+                if request.get('parallel'):
+                    from egowhale.wilor.parallel_stages import execute
+                    os.environ['EGOHAND_VIDEO_LABEL'] = request['label']
+                    os.environ['EGOHAND_PROGRESS_FILE'] = request['progress_file']
+                    execute(request, experiment, models)
+                    print(RESPONSE + json.dumps({'ok': True}), flush=True)
+                    continue
                 stage = request.get('stage')
                 if stage not in ('camera', 'hand'):
                     raise ValueError('分卡 worker 只接受 camera 或 hand 阶段')

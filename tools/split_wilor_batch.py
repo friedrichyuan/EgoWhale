@@ -22,15 +22,43 @@ def path_at_root(value):
     return (path if path.is_absolute() else ROOT / path).resolve()
 
 
+def launch_parallel(document, args, parser):
+    # The shell invokes this file directly from tools/.
+    sys.path.insert(0, str(ROOT))
+    from wilor_parallel_batch import run_parallel
+
+    cfg = document.split
+    input_dir = path_at_root(cfg.input_dir)
+    output_root = path_at_root(cfg.output_root)
+    python = args.python.expanduser().resolve()
+    maximum = args.max_videos if args.max_videos is not None else int(cfg.get("max_videos", 0))
+    if maximum < 0 or float(cfg.get("heartbeat_seconds", 10)) <= 0:
+        parser.error("视频上限必须非负，心跳间隔必须为正")
+    if not input_dir.is_dir() or not python.is_file() or output_root.is_relative_to(input_dir):
+        parser.error("检查输入目录、输出目录和 Python 路径")
+    videos = discover(input_dir)
+    if maximum:
+        videos = videos[:maximum]
+    if not videos:
+        parser.error("没有找到 MP4 视频")
+    return run_parallel(document, args, videos, output_root, args.config.resolve(), python, parser)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--python', type=Path, required=True)
     parser.add_argument('--max-videos', type=int, help='覆盖 YAML 的视频数，0 表示全部')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--resume-run', type=Path, help='复用一个并行批次下已完成的阶段')
     args = parser.parse_args()
     document = OmegaConf.load(args.config.resolve())
     cfg = document.get('split', document)
+    if "profiles" in cfg or args.resume_run:
+        if "split" not in document:
+            parser.error("并行批次需要统一 wilor.yaml 中的 split 配置")
+        return launch_parallel(document, args, parser)
+
     camera_gpus = [str(x) for x in cfg.camera_gpus]
     hand_gpus = [str(x) for x in cfg.wilor_gpus]
     all_gpus = camera_gpus + hand_gpus

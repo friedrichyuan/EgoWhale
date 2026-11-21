@@ -32,7 +32,7 @@ def _scene(height: int, width: int, robot):
     return scenes[(height, width)]
 
 
-def frame_checks(qpos, base, intrinsic, position, hand_valid, height, width, robot=None) -> dict[str, np.ndarray]:
+def frame_checks(qpos, base, intrinsic, position, hand_valid, height, width, robot=None, camera_to_world=None) -> dict[str, np.ndarray]:
     """Per-frame signals for the arm at `qpos`, seen from the video camera at height x width."""
     robot = load_robot() if robot is None else robot
     model, data, renderer = _scene(height, width, robot)
@@ -42,6 +42,10 @@ def frame_checks(qpos, base, intrinsic, position, hand_valid, height, width, rob
     parent = np.asarray(model.body_parentid)
     sites = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name) for name in robot.tcp_sites]
     count = len(qpos)
+    track = None if camera_to_world is None else robot.camera_track(camera_to_world)
+    camera = model.camera(robot.camera)
+    if track is not None and len(track[0]) != count:
+        raise ValueError("Curate camera/IK frame count mismatch")
     area = float(height * width)
     ik_error = np.full(count, np.nan)
     visible = np.zeros(count, dtype=bool)
@@ -49,6 +53,8 @@ def frame_checks(qpos, base, intrinsic, position, hand_valid, height, width, rob
     self_collision = np.zeros(count, dtype=bool)
     cross_arm = np.zeros(count, dtype=bool)
     for index in range(count):
+        if track is not None:
+            camera.pos[:], camera.quat[:] = track[0][index], track[1][index]
         data.qpos[:] = qpos[index]
         mujoco.mj_forward(model, data)
         errors = []

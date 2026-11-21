@@ -14,10 +14,29 @@ def frame_count(motion):
 
 
 def read_bases(path):
+    return read_base_placement(path)[0]
+
+
+def read_base_placement(path):
     data = json.loads(path.read_text())
     if "bases" in data:
-        return {name: np.asarray(matrix, dtype=np.float64) for name, matrix in data["bases"].items()}
-    return np.asarray(data["matrix"], dtype=np.float64)
+        bases = {name: np.asarray(matrix, dtype=np.float64) for name, matrix in data["bases"].items()}
+    else:
+        bases = np.asarray(data["matrix"], dtype=np.float64)
+    frame = data.get("base_frame", "camera")
+    if frame not in ("world", "camera"):
+        raise ValueError(f"Unknown base frame: {frame}")
+    return bases, frame
+
+
+def read_camera_to_world(src, start=0, stop=None):
+    import h5py
+
+    with h5py.File(src, "r") as handle:
+        camera = np.asarray(handle["transforms/camera"][start:stop], dtype=np.float32)
+    if camera.ndim != 3 or camera.shape[1:] != (4, 4) or not np.isfinite(camera).all():
+        raise ValueError(f"Invalid camera-to-world transforms in {src}")
+    return camera
 
 
 def prefix_length(dst):

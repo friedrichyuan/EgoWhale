@@ -11,7 +11,7 @@ from egowhale.media import frame_size, video_shape
 from egowhale.paths import BASE, COMPOSITE, GRIPPER, IK, QUALITY
 from egowhale.quality import actions, checks, vlm
 from egowhale.robots import load_robot
-from egowhale.robots.motion import prefix_length, read_bases, read_motion
+from egowhale.robots.motion import prefix_length, read_base_placement, read_camera_to_world, read_motion
 from egowhale.step import Step
 
 # An episode whose dropped share of frames is above this is not kept, and is not sent to the VLM.
@@ -37,7 +37,7 @@ class Curate(Step):
             fps = float(data["fps"])
             intrinsic = np.asarray(data["intrinsic"], dtype=np.float64).copy()
         qpos = self.robot.qpos(read_motion(dst / IK)).astype(np.float64)
-        base = read_bases(dst / BASE)
+        base, base_frame = read_base_placement(dst / BASE)
         frames = min(len(position), len(qpos))
         position, rotation, width, valid, qpos = (
             position[:frames],
@@ -49,7 +49,11 @@ class Curate(Step):
         _count, video_h, video_w, _video_fps = video_shape(dst / COMPOSITE)
         scale = video_h / frame_size(Path(src).with_suffix(".mp4"))[0]
         intrinsic[:2] *= scale
-        signals = checks.frame_checks(qpos, base, intrinsic, position, valid, video_h, video_w, self.robot)
+        camera = read_camera_to_world(src, stop=frames) if base_frame == "world" else None
+        target = position if camera is None else (
+            np.einsum("fij,fhj->fhi", camera[:, :3, :3], position) + camera[:, None, :3, 3]
+        )
+        signals = checks.frame_checks(qpos, base, intrinsic, target, valid, video_h, video_w, self.robot, camera)
         l1 = checks.erode(checks.passed(signals), fps)
         state, action = actions.trajectory(position, rotation, width)
         outlier = actions.outliers(action, l1)

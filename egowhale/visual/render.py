@@ -10,7 +10,7 @@ import numpy as np
 from egowhale.media import SCALE, data_fps, video_shape
 from egowhale.paths import BASE, GRIPPER, IK, PREFIX, RENDER
 from egowhale.robots import load_robot
-from egowhale.robots.motion import read_bases, read_motion
+from egowhale.robots.motion import read_base_placement, read_camera_to_world, read_motion
 from egowhale.step import Step
 
 GRIPPER_PART = 2
@@ -41,16 +41,19 @@ class Render(Step):
             intrinsic = np.asarray(data["intrinsic"], dtype=np.float64)
         intrinsic = intrinsic.copy()
         intrinsic[:2] *= height / source_h
-        base = read_bases(dst / BASE)
+        base, frame = read_base_placement(dst / BASE)
         where, start, stop = self.piece(dst, index)
+        camera = read_camera_to_world(src, start, stop) if frame == "world" else None
         if index == 0 and (dst / PREFIX).is_file():
             prefix = read_motion(dst / PREFIX)
             if not np.isclose(data_fps(prefix), fps, rtol=1e-5):
                 raise ValueError("approach/video FPS mismatch")
             rows = np.concatenate((self.robot.qpos(prefix), qpos[1:stop]), axis=0)
+            if camera is not None:
+                camera = np.concatenate((np.repeat(camera[:1], len(rows) - len(camera) + 1, axis=0), camera[1:]))
         else:
             rows = qpos[start:stop]
-        rgb, robot_mask, gripper_mask, depth = _render(rows, base, intrinsic, height, width, self.robot)
+        rgb, robot_mask, gripper_mask, depth = _render(rows, base, intrinsic, height, width, self.robot, camera)
         part = _postprocess(rgb, robot_mask, gripper_mask, depth)
         path = where / RENDER
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,17 +94,23 @@ def _scene(height: int, width: int, robot):
     return scenes[(height, width)]
 
 
-def _render(qpos, base, intrinsic, height, width, robot=None):
+def _render(qpos, base, intrinsic, height, width, robot=None, camera_to_world=None):
     robot = load_robot() if robot is None else robot
     model, data, renderer, gripper_ids = _scene(height, width, robot)
     robot.place_bases(model, base)
     robot.place_camera(model, intrinsic, height)
     count = len(qpos)
+    track = None if camera_to_world is None else robot.camera_track(camera_to_world)
+    if track is not None and len(track[0]) != count:
+        raise ValueError("Render camera/IK frame count mismatch")
+    camera = model.camera(robot.camera)
     rgb = np.zeros((count, height, width, 3), dtype=np.uint8)
     robot_mask = np.zeros((count, height, width), dtype=bool)
     gripper_mask = np.zeros((count, height, width), dtype=bool)
     depth = np.zeros((count, height, width), dtype=np.float32)
     for index in range(count):
+        if track is not None:
+            camera.pos[:], camera.quat[:] = track[0][index], track[1][index]
         data.qpos[:] = qpos[index]
         mujoco.mj_forward(model, data)
         renderer.update_scene(data, camera=robot.camera)

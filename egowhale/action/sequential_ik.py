@@ -558,6 +558,10 @@ class CuroboBackend:
 
         gc.collect()
 
+    def base_candidates(self, offsets, position, valid, group, seed_r, seed_t, geometry):
+        eligible = core._eligible(offsets, position, valid, group, seed_r, seed_t, geometry)
+        return eligible, geometry
+
     def prepare(self, data):
         core.data_fps(data)  # Validate before allocating any GPU state.
         length = len(data["position"])
@@ -576,7 +580,9 @@ class CuroboBackend:
             geometry = None if "camera_size" not in data else (
                 self.base_bounds.get(group.name), data["intrinsic"], data["camera_size"],
             )
-            eligible = core._eligible(offsets, position, valid, group, seed_r, seed_t, geometry)
+            eligible, geometry = self.base_candidates(
+                offsets, position, valid, group, seed_r, seed_t, geometry,
+            )
             posed = [core._into_base(gp, gr, core._camera_matrix(seed_r, seed_t, o)) for o in offsets]
             p, q = core._wxyz_pair(np.stack([p for p, r in posed], axis=1), np.stack([r for p, r in posed], axis=1))
             tasks.append(

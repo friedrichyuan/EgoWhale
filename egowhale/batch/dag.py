@@ -72,9 +72,6 @@ class Job:
         self.error = ""
         self.ran = False
         self.started = time.perf_counter()
-        # Position in the run, and whether its composite goes to TensorBoard.
-        self.index = 0
-        self.watch = False
 
     @property
     def name(self) -> str:

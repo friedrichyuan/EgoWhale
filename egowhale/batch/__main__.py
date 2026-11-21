@@ -7,7 +7,6 @@ from pathlib import Path
 
 from egowhale import config as configs
 from egowhale.batch.dag import Job
-from egowhale.batch.report import watched
 from egowhale.batch.resources import pools_from
 from egowhale.batch.scheduler import serve
 from egowhale.config import ConfigError
@@ -36,10 +35,6 @@ def main() -> None:
         (out / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
         jobs = [Job(src, out / src.parent.name / src.stem, cfg["piece_frames"], approach=cfg["approach"]) for src in sources]
         pools, share = pools_from(cfg)
-        watch = watched(len(jobs))
-        for index, job in enumerate(jobs):
-            job.index = index
-            job.watch = index in watch
         serve(jobs, cfg, pools, share)
     except ConfigError as exc:
         raise SystemExit(str(exc)) from None

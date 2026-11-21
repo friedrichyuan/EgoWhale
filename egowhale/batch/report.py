@@ -11,7 +11,6 @@ import numpy as np
 
 from egowhale.batch.dag import STEPS, Job
 from egowhale.batch.monitor import SystemMonitor
-from egowhale.step import short_error
 
 # (pool, display name, category, model or role)
 PLACED = (
@@ -27,9 +26,7 @@ PLACED = (
     ("action_read", "Action-Read", "IO", "prefetch"),
     ("action_write", "Action-Write", "IO", "store"),
 )
-# Episodes whose inpainted scene and composite go to TensorBoard, as a share of the run.
-WATCHED = 0.1
-# Frames of one watched episode, and their height in the side-by-side video.
+# Frame count and height for one side-by-side preview.
 COMPARE_FRAMES = 32
 COMPARE_HEIGHT = 360
 
@@ -77,14 +74,6 @@ def boot(free: dict, log, pools: dict[str, int], models: dict[str, str] | None =
             # Compact device list, e.g. "0, 1, 2" or "cpu".
             devices = ", ".join(dict.fromkeys(found[pool])).replace("cuda:", "")
             _row(log, "Running", category, name, str(pools.get(pool, "")), devices, model)
-
-
-def watched(count: int) -> set[int]:
-    """Evenly spaced episode indexes, WATCHED of them."""
-    if count <= 0:
-        return set()
-    keep = min(count, max(1, int(round(count * WATCHED))))
-    return {int(index) for index in np.unique(np.round(np.linspace(0, count - 1, keep)).astype(int))}
 
 
 class Meter:
@@ -179,11 +168,6 @@ class Report:
         }
         self.meter.finish(job)
         self.meter.write(self.writer, force=True)
-        if row["ok"] and job.watch:
-            try:
-                _compare(job, self.writer)
-            except Exception as exc:
-                row["compare"] = short_error(exc)
         self.log.parent.mkdir(parents=True, exist_ok=True)
         with self.log.open("a") as handle:
             handle.write(json.dumps(row) + "\n")
@@ -195,7 +179,7 @@ class Report:
         self.writer.close()
 
 
-def _compare(job: Job, writer) -> None:
+def write_comparison(job: Job, writer, step: int) -> None:
     """Up to COMPARE_FRAMES frames of the inpainted scene beside the composite. Only those frames are decoded."""
     from egowhale.media import read_frames, video_shape
     from egowhale.paths import COMPOSITE, INPAINT
@@ -216,7 +200,7 @@ def _compare(job: Job, writer) -> None:
     count = min(len(before), len(after))
     frames = [_pair(_fit(before[index]), _fit(after[index])) for index in range(count)]
     video = np.stack(frames).transpose(0, 3, 1, 2)[None]
-    writer.add_video("compare/" + job.name.replace("/", "_"), video, job.index, fps=4)
+    writer.add_video("compare/" + job.name.replace("/", "_"), video, step, fps=4)
     writer.flush()
 
 

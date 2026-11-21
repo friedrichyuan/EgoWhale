@@ -10,15 +10,15 @@ piece_frames: 600
 approach: false
 
 nodes:
-  segment: {cards: 2, actors_per_card: 4}
-  inpaint: {cards: 2, model: sttn}
-  depth: {cards: 4, window: 1, frames_per_forward: 96}
-  action: {ride: inpaint, actors_per_card: 1, gpu_share: 0.1}
-  render: {actors: 4}
-  cpu: {actors: 8}
+  segment: {cards: 2, actors_per_card: 1}
+  inpaint: {cards: 1, model: sttn}
+  depth: {cards: 3, window: 1, frames_per_forward: 96}
+  action: {ride: depth, actors_per_card: 1, gpu_share: 0.1, ik_method: base_ik_seq, batch_size: 8640}
+  render: {actors: 2}
+  cpu: {actors: 2}
 
 io:
-  readers_per_lane: 2
+  readers_per_lane: 1
   queue_per_lane: 4
   queue_frames: 1200
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: prepare_fixed500.sh RETARGET_GPUS SEGMENT_GPUS [DEPTH_GPUS]
-# Each argument is a comma-separated list of physical GPU indices.
+# Activate the project Python environment first. Each argument is a list of physical GPU indices.
 # With two arguments, retarget/segment/inpaint share the first group, depth uses the second.
 # This runs only prerequisites. Each node retains its own log and fresh output root.
 set -euo pipefail
@@ -9,7 +9,6 @@ if [[ $# != 2 && $# != 3 ]]; then
   echo "Usage: bash scripts/prepare_fixed500.sh GPU_A GPU_B or RETARGET_GPUS SEGMENT_GPUS DEPTH_GPUS" >&2
   exit 2
 fi
-export PATH="/export/pgs/heqijun/miniconda3/envs/egowhale/bin:$PATH"
 export NUMPY_MADVISE_HUGEPAGE=0
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"

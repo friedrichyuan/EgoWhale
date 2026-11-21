@@ -10,8 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from egowhale.batch.dag import STEPS, Job
-from egowhale.batch.resources import available_gb, total_gb
-from egowhale.step import short_error
+from egowhale.batch.monitor import SystemMonitor
 
 # (pool, display name, category, model or role)
 PLACED = (
@@ -27,9 +26,7 @@ PLACED = (
     ("action_read", "Action-Read", "IO", "prefetch"),
     ("action_write", "Action-Write", "IO", "store"),
 )
-# Episodes whose inpainted scene and composite go to TensorBoard, as a share of the run.
-WATCHED = 0.1
-# Frames of one watched episode, and their height in the side-by-side video.
+# Frame count and height for one side-by-side preview.
 COMPARE_FRAMES = 32
 COMPARE_HEIGHT = 360
 
@@ -79,19 +76,11 @@ def boot(free: dict, log, pools: dict[str, int], models: dict[str, str] | None =
             _row(log, "Running", category, name, str(pools.get(pool, "")), devices, model)
 
 
-def watched(count: int) -> set[int]:
-    """Evenly spaced episode indexes, WATCHED of them."""
-    if count <= 0:
-        return set()
-    keep = min(count, max(1, int(round(count * WATCHED))))
-    return {int(index) for index in np.unique(np.round(np.linspace(0, count - 1, keep)).astype(int))}
-
-
 class Meter:
     """TensorBoard scalars, at most one point per MIN_INTERVAL seconds, plus one at each finished episode.
 
     system/ok and system/failed count episodes; system/fps is cumulative frames over elapsed seconds and
-    system/fps_5m the same over the last five minutes; system/memory_used_gb is host RAM when written.
+    system/fps_5m the same over the last five minutes. SystemMonitor samples hardware separately every 2 s.
     node/<stage>/fps uses the pool's cumulative compute time, times its actor count, so it shows what the pool
     can do: two episodes on one pool of N actors show N times the per-actor rate.
     The step is wall-clock seconds since boot.
@@ -144,9 +133,6 @@ class Meter:
             df = self._window[-1][1] - self._window[0][1]
             if dt >= 1:
                 writer.add_scalar("system/fps_5m", df / dt, step)
-        available = available_gb()
-        if available is not None:
-            writer.add_scalar("system/memory_used_gb", total_gb() - available, step)
         for name, node in self.nodes.items():
             if name in self.REPORTED and node["seconds"] >= 0.05:
                 writer.add_scalar(f"node/{name}/fps", node["frames"] / node["seconds"] * self.actors[name], step)
@@ -160,8 +146,10 @@ class Report:
 
         self.log = out / "batch.jsonl"
         self.board = out / "tb"
-        self.writer = SummaryWriter(log_dir=str(self.board))
+        self.writer = SummaryWriter(log_dir=str(self.board), flush_secs=5)
         self.meter = Meter(actors)
+        self.system = SystemMonitor(self.writer, self.meter.wall0)
+        self.system.start()
 
     def note(self, stage: str, frames: int, seconds: float) -> None:
         self.meter.note(stage, frames, seconds)
@@ -180,27 +168,24 @@ class Report:
         }
         self.meter.finish(job)
         self.meter.write(self.writer, force=True)
-        if row["ok"] and job.watch:
-            try:
-                _compare(job, self.writer)
-            except Exception as exc:
-                row["compare"] = short_error(exc)
         self.log.parent.mkdir(parents=True, exist_ok=True)
         with self.log.open("a") as handle:
             handle.write(json.dumps(row) + "\n")
 
     def close(self) -> None:
+        self.system.close()
         self.meter.write(self.writer, force=True)
         self.writer.flush()
         self.writer.close()
 
 
-def _compare(job: Job, writer) -> None:
+def write_comparison(job: Job, writer, step: int) -> None:
     """Up to COMPARE_FRAMES frames of the inpainted scene beside the composite. Only those frames are decoded."""
     from egowhale.media import read_frames, video_shape
-    from egowhale.paths import COMPOSITE, INPAINT, PREFIX
+    from egowhale.paths import COMPOSITE, INPAINT
+    from egowhale.robots.motion import prefix_length
 
-    prefix = len(np.load(job.dst / PREFIX)["qpos"])
+    prefix = prefix_length(job.dst)
     count = min(job.frames, video_shape(job.dst / COMPOSITE)[0] - max(prefix - 1, 0))
     if count <= 0:
         return
@@ -215,7 +200,7 @@ def _compare(job: Job, writer) -> None:
     count = min(len(before), len(after))
     frames = [_pair(_fit(before[index]), _fit(after[index])) for index in range(count)]
     video = np.stack(frames).transpose(0, 3, 1, 2)[None]
-    writer.add_video("compare/" + job.name.replace("/", "_"), video, job.index, fps=4)
+    writer.add_video("compare/" + job.name.replace("/", "_"), video, step, fps=4)
     writer.flush()
 
 

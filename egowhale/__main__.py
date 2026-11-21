@@ -8,8 +8,11 @@ from pathlib import Path
 from egowhale.action.approach import Approach
 from egowhale.action.base_ik import BaseIK
 from egowhale.action.retarget import Retarget
+from egowhale.config import ConfigError, ik_options, read_config
 from egowhale.paths import default_out
 from egowhale.quality.curate import Curate
+from egowhale.robots import ROBOT_NAMES
+from egowhale.robots.factory import make_step
 from egowhale.step import run
 from egowhale.visual.composite import Composite
 from egowhale.visual.depth import Depth
@@ -27,11 +30,27 @@ def main() -> None:
     parser.add_argument("out", type=Path, nargs="?", help="output directory; default outputs/<task>/<episode>")
     parser.add_argument("--steps", nargs="+", choices=names, metavar="NAME", help=f"run only these, in pipeline order: {' '.join(names)}")
     parser.add_argument("--inpaint-model", choices=MODELS, default=DEFAULT_MODEL)
+    parser.add_argument("--robot", choices=ROBOT_NAMES)
+    parser.add_argument("--config", type=Path, help="YAML for robot and Base IK settings")
+    parser.add_argument("--no-approach", action="store_true", help="do not generate an approach prefix")
     args = parser.parse_args()
     src = args.episode.expanduser().resolve()
     dst = args.out.expanduser().resolve() if args.out else default_out(src)
     chosen = [step for step in STEPS if args.steps is None or step.name in args.steps]
-    run(src, dst, tuple(Inpaint(args.inpaint_model) if step is Inpaint else step for step in chosen))
+    if args.no_approach:
+        chosen = [step for step in chosen if step is not Approach]
+    method, size = "base_ik", 0
+    robot = args.robot or "arx"
+    if args.config:
+        try:
+            cfg = read_config(args.config)
+            robot = args.robot or cfg["robot"]
+            if BaseIK in chosen:
+                method, size, _ = ik_options(cfg["nodes"]["action"], robot)
+        except (ConfigError, OSError) as exc:
+            parser.error(str(exc))
+    run(src, dst, tuple(Inpaint(args.inpaint_model) if step is Inpaint else
+                        make_step(step, robot, ik_method=method, batch_size=size) for step in chosen))
     print(f"wrote {dst}")
 
 

@@ -37,6 +37,11 @@ class VisualLane:
     ready: list = field(default_factory=list)
     # ref -> frames on the GPU.
     inflight: dict = field(default_factory=dict)
+    # Writer ref -> frames, including queued commits. GPU calls reserve their output slots too.
+    writing: dict = field(default_factory=dict)
+
+    def output_room(self, limit: int) -> bool:
+        return not limit or len(self.inflight) + len(self.writing) < limit
 
     def load(self) -> int:
         return len(self.busy) + len(self.ready) + len(self.inflight)
@@ -86,6 +91,7 @@ class Scheduler:
         io = cfg["io"]
         self.queue_count = io["queue_per_lane"]
         self.queue_frames = io["queue_frames"]
+        self.write_slots = io["write_slots_per_lane"]
         self.reserve = cfg["memory"]["reserve_gb"]
         readers = [actor for _label, actor in free.pop("feed")]
         writers = [actor for _label, actor in free.pop("write")]
@@ -101,6 +107,13 @@ class Scheduler:
                 free.pop("action"), free.pop("action_read"), free.pop("action_write"), strict=True
             )
         ]
+
+        self.episode_actions = None
+        batch_size = cfg["nodes"]["action"].get("batch_size", 0)
+        if cfg["nodes"]["action"].get("ik_method", "base_ik_seq" if batch_size else "base_ik") == "base_ik_seq":
+            from egowhale.action.base_ik_seq import episode_capacity
+            from egowhale.batch.episode_actions import EpisodeActions
+            self.episode_actions = EpisodeActions(self, episode_capacity(cfg.get("robot", "arx"), batch_size), batch_size)
 
     # Bookkeeping ---------------------------------------------------------------------------------------------
 
@@ -130,7 +143,7 @@ class Scheduler:
 
     def fill_one(self, lane: VisualLane) -> bool:
         """Start decoding more pieces for this lane, if it has room in count, frames, and host memory."""
-        if lane.load() >= self.queue_count:
+        if lane.load() >= self.queue_count or not lane.output_room(self.write_slots):
             return False
         owners = [owner for owner, _frames in lane.busy.values()]
         reader = next((item for item in lane.readers if item not in owners), None)
@@ -163,14 +176,18 @@ class Scheduler:
                 progress |= self.fill_one(lane)
 
     def launch(self, lane: VisualLane) -> None:
-        while len(lane.inflight) < INFLIGHT and lane.ready:
+        while len(lane.inflight) < INFLIGHT and lane.ready and lane.output_room(self.write_slots):
             data, chosen, frames = lane.ready.pop(0)
             if all(job.failed for job, _index in chosen):
                 # Every episode in this batch failed while it was decoding; its pieces need no GPU.
                 for job, index in chosen:
                     job.running.discard((lane.stage, index))
                 continue
-            launched = lane.actor.consume.remote(data, self.budget.get(lane.stage))
+            try:
+                launched = lane.actor.consume.remote(data, self.budget.get(lane.stage))
+            except Exception as exc:
+                self.apply(chosen, [Result(False, 0.0, short_error(exc))] * len(chosen), lane.stage)
+                continue
             lane.inflight[launched] = frames
             self.pending[launched] = (self.on_visual, (lane, chosen))
 
@@ -185,25 +202,37 @@ class Scheduler:
 
         chosen = list(chosen)
         stage = lane.stage
-        lane.inflight.pop(ref, None)
-        self.launch(lane)
-        self.fill()
+        frames = lane.inflight[ref]
+        stored = None
         try:
             payload = ray.get(ref)
+            rows = [Result(*row) for row in payload["results"]]
+            if len(rows) != len(chosen):
+                rows = [Result(False, 0.0, "batch result mismatch")] * len(chosen)
+            elif stage in self.budget and "budget" in payload:
+                self.adjust_budget(stage, int(payload["budget"]))
+            save_ref = payload.get("save_ref")
+            if save_ref is not None:
+                stored = lane.writer.commit.remote(save_ref)
+                # Transfer the reservation to the writer before launching or decoding more work.
+                lane.writing[stored] = frames
+                self.pending[stored] = (self.on_visual_write, (lane, chosen, rows))
         except Exception as exc:
-            self.apply(chosen, [Result(False, 0.0, short_error(exc))] * len(chosen), stage)
-            return
-        rows = [Result(*row) for row in payload["results"]]
-        if len(rows) != len(chosen):
-            rows = [Result(False, 0.0, "batch result mismatch")] * len(chosen)
-        elif stage in self.budget and "budget" in payload:
-            self.adjust_budget(stage, int(payload["budget"]))
-        save_ref = payload.get("save_ref")
-        if save_ref is None:
+            rows = [Result(False, 0.0, short_error(exc))] * len(chosen)
+        finally:
+            lane.inflight.pop(ref)
+        if stored is None:
             self.apply(chosen, rows, stage)
-            return
-        stored = lane.writer.commit.remote(save_ref)
-        self.pending[stored] = (self.on_write, (stage, chosen, rows))
+        self.launch(lane)
+        self.fill()
+
+    def on_visual_write(self, ref, lane: VisualLane, chosen, rows) -> None:
+        try:
+            self.on_write(ref, lane.stage, chosen, rows)
+        finally:
+            lane.writing.pop(ref)
+        self.launch(lane)
+        self.fill()
 
     def adjust_budget(self, stage: str, given: int) -> None:
         if given < self.budget[stage]:
@@ -225,6 +254,9 @@ class Scheduler:
     # Action lanes --------------------------------------------------------------------------------------------
 
     def feed_actions(self) -> None:
+        if self.episode_actions is not None:
+            self.episode_actions.feed()
+            return
         taken = {id(job) for lane in self.action_lanes for job in (lane.job, lane.next_job) if job is not None}
         for lane in self.action_lanes:
             idle = lane.idle()
@@ -367,7 +399,9 @@ def serve(jobs: list[Job], cfg: dict, pools: dict[str, int], share: dict[str, fl
     preflight(cfg, pools, share, height, width)
     journal = logger()
     model = cfg["nodes"]["inpaint"]["model"]
-    free = make_actors(pools, share, cfg["io"]["cpus"], cfg["nodes"]["depth"]["window"], model)
+    action = cfg["nodes"]["action"]
+    free = make_actors(pools, share, cfg["io"]["cpus"], cfg["nodes"]["depth"]["window"], model,
+                       cfg.get("robot", "arx"), action.get("ik_method") or ("base_ik_seq" if action["batch_size"] else "base_ik"), action["batch_size"])
     boot(free, journal, pools, {"inpaint": LABELS[model]})
     # Render and curate draw with EGL on the action cards, which cuRobo leaves mostly idle.
     cards = sorted({device.split(":")[-1] for device in ray.get([actor.ready.remote() for _label, actor in free["action"]])})

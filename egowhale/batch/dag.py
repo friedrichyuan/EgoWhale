@@ -60,7 +60,8 @@ GPU_POOLS = ("segment", "inpaint", "depth", "action")
 class Job:
     """One episode. Work is tracked as units: (stage, piece index) for per-piece stages, (stage, None) otherwise."""
 
-    def __init__(self, src: Path, dst: Path, limit: int, spans: list[tuple[int, int]] | None = None):
+    def __init__(self, src: Path, dst: Path, limit: int, spans: list[tuple[int, int]] | None = None, approach: bool = True):
+        self.approach = approach
         self.src = src
         self.dst = dst
         self.spans = spans if spans is not None else plan(src, dst, limit)
@@ -71,16 +72,13 @@ class Job:
         self.error = ""
         self.ran = False
         self.started = time.perf_counter()
-        # Position in the run, and whether its composite goes to TensorBoard.
-        self.index = 0
-        self.watch = False
 
     @property
     def name(self) -> str:
         return f"{self.src.parent.name}/{self.src.stem}"
 
     def units(self) -> list[tuple[str, int | None]]:
-        return [(stage, index) for stage in DEPS for index in (range(len(self.spans)) if stage in PIECED else (None,))]
+        return [(stage, index) for stage in DEPS if self.approach or stage != "approach" for index in (range(len(self.spans)) if stage in PIECED else (None,))]
 
     def ready(self) -> list[tuple[str, int | None]]:
         if self.failed:
@@ -90,6 +88,8 @@ class Job:
     def _met(self, unit) -> bool:
         stage, index = unit
         for dep in DEPS[stage]:
+            if dep == "approach" and not self.approach:
+                continue
             if dep not in PIECED:
                 wanted = [(dep, None)]
             elif index is not None:

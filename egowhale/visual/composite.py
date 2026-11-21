@@ -8,8 +8,9 @@ import cv2
 import numpy as np
 
 from egowhale.media import RgbWriter, load_masks, read_rgb
-from egowhale.paths import COMPOSITE, DEPTH, INPAINT, MASKS, PREFIX, RENDER
+from egowhale.paths import COMPOSITE, DEPTH, INPAINT, MASKS, RENDER
 from egowhale.pieces import piece_dir, pieces
+from egowhale.robots.motion import prefix_length
 from egowhale.step import Step
 from egowhale.visual.render import load_render
 
@@ -18,13 +19,13 @@ _HAND_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 class Composite(Step):
     name = "composite"
-    needs = (INPAINT, RENDER, DEPTH, MASKS, PREFIX)
+    needs = (INPAINT, RENDER, DEPTH, MASKS)
     makes = (COMPOSITE,)
 
     def run(self, src: Path, dst: Path) -> None:
         """Pieces are merged here: each is composited in order and appended to one video."""
         dst = Path(dst)
-        prefix = len(np.load(dst / PREFIX)["qpos"])
+        prefix = prefix_length(dst)
         spans = pieces(dst)
         writer = None
         try:

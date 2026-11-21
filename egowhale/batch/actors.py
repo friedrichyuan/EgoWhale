@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from egowhale.batch.dag import ACTION, STEPS, VISUAL
+from egowhale.robots.factory import make_step
 from egowhale.step import Result, execute, short_error
 
 
@@ -32,8 +33,8 @@ def _visual_steps(inpaint_model: str, window: int) -> dict:
     return {name: _visual_step(name, inpaint_model, window) for name in VISUAL}
 
 
-def _action_steps() -> dict:
-    return {name: STEPS[name]() for name in ACTION}
+def _action_steps(robot="arx", ik_method="base_ik", batch_size=0) -> dict:
+    return {name: make_step(STEPS[name], robot, ik_method=ik_method, batch_size=batch_size) for name in ACTION}
 
 
 class _Cpu:
@@ -72,8 +73,62 @@ class DepthActor(_Visual):
 
 
 class ActionActor(_Gpu):
-    def __init__(self):
-        self.steps = _action_steps()
+    def __init__(self, robot="arx", ik_method="base_ik", batch_size=0):
+        self.steps = _action_steps(robot, ik_method, batch_size)
+
+    def advance_ik(self, payload, batch_size, start=0, count=0):
+        """Transport adapter only: persistent IK state belongs to the node's stream."""
+        import ray
+        started = time.perf_counter()
+        if getattr(self, "ik_stream", None) is None:
+            self.ik_stream = self.steps["base_ik"].open_stream(batch_size)
+            self.ik_seconds = {}
+        selected = [] if payload is None else payload[start:start+count]
+        arrivals = [(item["dst"],item["data"]) for item in selected if item["ok"]]
+        rows = [dict(token=item["dst"],ok=False,error=item["error"],seconds=0.,save_ref=None)
+                for item in selected if not item["ok"]]
+        tokens = set(self.ik_stream.active) | {token for token,_ in arrivals}
+        try:
+            completed = self.ik_stream.advance(arrivals)
+        except Exception as exc:
+            completed = [dict(token=t,ok=False,error=short_error(exc)) for t in tokens]
+            self.ik_stream.close()
+            self.ik_stream = None
+        elapsed = time.perf_counter()-started
+        for token in tokens:
+            self.ik_seconds[token] = self.ik_seconds.get(token,0.) + elapsed/max(len(tokens),1)
+        for row in completed:
+            token = row["token"]
+            row["seconds"] = self.ik_seconds.pop(token,0.)
+            row["save_ref"] = (ray.put(dict(stage="base_ik",dst=token,out=row.pop("out"))) if row["ok"] else None)
+            rows.append(row)
+        return dict(rows=rows,live=list(self.ik_stream.active) if self.ik_stream else [])
+
+    def compute_many(self, stage, payload, batch_size):
+        import gc
+
+        import ray
+        import torch
+        started = time.perf_counter()
+        rows = [{"ok": False, "error": item.get("error", "read failed"), "seconds": 0., "save_ref": None} for item in payload]
+        good = [i for i, item in enumerate(payload) if item["ok"]]
+        try:
+            if good:
+                data = [payload[i]["data"] for i in good]
+                if stage == "base_ik":
+                    raise ValueError("streaming Base_IK must use advance_ik")
+                outputs = [self.steps[stage].compute(item) for item in data]
+                seconds = (time.perf_counter() - started) / len(good)
+                for i, out in zip(good, outputs, strict=True):
+                    packed = {"stage": stage, "dst": payload[i]["dst"], "out": out}
+                    rows[i] = {"ok": True, "seconds": seconds, "save_ref": ray.put(packed)}
+        except Exception as exc:
+            for i in good:
+                rows[i] = {"ok": False, "error": short_error(exc), "seconds": 0., "save_ref": None}
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+        return rows
 
     def compute(self, stage, dst, data):
         import gc
@@ -99,8 +154,8 @@ class _Runner(_Cpu):
 
     stages: tuple[str, ...] = ()
 
-    def __init__(self):
-        self.steps = {name: STEPS[name]() for name in self.stages}
+    def __init__(self, robot="arx"):
+        self.steps = {name: make_step(STEPS[name], robot) for name in self.stages}
 
     def egl(self, card):
         egl(card)
@@ -112,10 +167,10 @@ class _Runner(_Cpu):
 class CpuActor(_Runner):
     stages = ("composite", "curate")
 
-    def __init__(self):
+    def __init__(self, robot="arx"):
         # Batch runs do not call the VLM.
         os.environ.pop("EGOWHALE_VLM_API_KEY", None)
-        super().__init__()
+        super().__init__(robot)
 
 
 class RenderActor(_Runner):
@@ -149,24 +204,35 @@ class StoreActor(_Cpu):
 
     def commit(self, saves):
         for save in saves:
-            self.steps[save["stage"]].store(save)
+            stage = save["stage"]
+            self.steps[stage].store(save)
         return True
 
 
 class ActionReadActor(_Cpu):
-    def __init__(self):
-        self.steps = _action_steps()
+    def __init__(self, robot="arx"):
+        self.steps = _action_steps(robot)
+
+    def load_many(self, stage, units):
+        rows = []
+        for src, dst in units:
+            try:
+                rows.append({"ok": True, "dst": dst, "data": self.load(stage, src, dst)})
+            except Exception as exc:
+                rows.append({"ok": False, "dst": dst, "error": short_error(exc)})
+        return rows
 
     def load(self, stage, src, dst):
         return self.steps[stage].read(Path(src), Path(dst))
 
 
 class ActionWriteActor(_Cpu):
-    def __init__(self):
-        self.steps = _action_steps()
+    def __init__(self, robot="arx"):
+        self.steps = _action_steps(robot)
 
     def save(self, packed):
-        self.steps[packed["stage"]].save(Path(packed["dst"]), packed["out"])
+        stage = packed["stage"]
+        self.steps[stage].save(Path(packed["dst"]), packed["out"])
         return True
 
 
@@ -186,7 +252,7 @@ POOLS = {
 }
 
 
-def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, int], window: int, inpaint_model: str):
+def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, int], window: int, inpaint_model: str, robot: str = "arx", ik_method="base_ik", batch_size=0):
     """Every pool's actors as (label, handle). `share` is the GPU fraction for pools that stack on one card."""
     import ray
 
@@ -195,10 +261,12 @@ def make_actors(pools: dict[str, int], share: dict[str, float], cpus: dict[str, 
     def make(names) -> None:
         for name in names:
             cls, options, configured = POOLS[name]
-            remote = ray.remote(**options(cpus))(cls)
+            remote = ray.remote(enable_task_events=False, **options(cpus))(cls)
             if name in share:
                 remote = remote.options(num_gpus=share[name])
-            args = (inpaint_model, window) if configured else ()
+            args = (inpaint_model, window) if configured else (robot,)
+            if name == "action":
+                args = (robot, ik_method, batch_size)
             made[name] = [(f"{name}{index}", remote.remote(*args)) for index in range(pools[name])]
 
     # Whole cards are placed before fractional ones so a shared card cannot take a slot a whole actor needs.

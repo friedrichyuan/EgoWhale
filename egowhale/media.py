@@ -8,7 +8,7 @@ import numpy as np
 
 # Inpaint, depth, and render all work at this fraction of the source video.
 SCALE = 0.5
-# EgoDex records at 30 fps.
+# Legacy metadata fallback only; actual video and motion FPS travel with each episode.
 FPS = 30.0
 # Frames decoded at once by chunked readers and writers. Full-size frames never pile up beyond this.
 CHUNK = 32
@@ -21,6 +21,18 @@ def video_path(src: Path) -> Path:
     """Resolve an episode video without requiring annotations."""
     src = Path(src)
     return src.with_suffix(".mp4") if src.suffix in (".hdf5", ".h5") else src
+
+def valid_fps(value) -> float:
+    """Reject unusable timebases instead of propagating NaN/zero into motion."""
+    value = float(value)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"invalid FPS: {value}")
+    return value
+
+
+def data_fps(data) -> float:
+    """Old motion files without FPS were produced at 30; new files carry it explicitly."""
+    return valid_fps(data.get("fps", FPS))
 
 
 def save_masks(path: Path, masks: np.ndarray) -> None:
@@ -46,7 +58,7 @@ def read_rgb(path: Path, start: int = 0, stop: int | None = None) -> tuple[np.nd
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise FileNotFoundError(path)
-    fps = float(capture.get(cv2.CAP_PROP_FPS) or FPS)
+    fps = valid_fps(capture.get(cv2.CAP_PROP_FPS))
     # The container's count only sizes the array; decoding still runs to `stop` or the end.
     expected = max(int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0) if stop is None else stop, start + 1) - start
     if start:
@@ -113,7 +125,7 @@ def video_shape(path: Path) -> tuple[int, int, int, float]:
             int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0),
             int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
             int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
-            float(capture.get(cv2.CAP_PROP_FPS) or FPS),
+            valid_fps(capture.get(cv2.CAP_PROP_FPS)),
         )
     finally:
         capture.release()
@@ -134,7 +146,7 @@ def read_chunks(path: Path, start: int, stop: int, chunk: int = CHUNK):
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise FileNotFoundError(path)
-    fps = float(capture.get(cv2.CAP_PROP_FPS) or FPS)
+    fps = valid_fps(capture.get(cv2.CAP_PROP_FPS))
     if start:
         capture.set(cv2.CAP_PROP_POS_FRAMES, start)
     position = start
@@ -193,7 +205,7 @@ class RgbWriter:
 
     def __init__(self, path: Path, fps: float):
         self.path = Path(path)
-        self.fps = fps
+        self.fps = valid_fps(fps)
         self._writer = None
 
     def write(self, frames: np.ndarray) -> None:

@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+monitor = ["psutil", "nvidia-ml-py"]
 
 [tool.setuptools.packages.find]
 include = ["egowhale*"]

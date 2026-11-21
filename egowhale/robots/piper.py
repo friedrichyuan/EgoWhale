@@ -128,7 +128,10 @@ class PiperRobot(Robot):
                 "cspace": {"joint_names": list(joints), "default_joint_position": home.tolist(),
                            "null_space_weight": [1.] * 6, "cspace_distance_weight": [1.] * 6,
                            "max_acceleration": 15., "max_jerk": 500.}}}}
-            result.append(SolveGroup(side, (side_index,), joints, tools, config, lower, upper, home, .626, BOUNDS.copy(), batch_key="piper"))
+            # AgileX standard PiPer published J1–J6 max angular speed.
+            speed = np.deg2rad([180., 195., 180., 225., 225., 225.])
+            result.append(SolveGroup(side, (side_index,), joints, tools, config, lower, upper, home, .626,
+                                     BOUNDS.copy(), batch_key="piper", rated_velocity=speed))
         return tuple(result)
 
     def gripper_positions(self, width, valid):

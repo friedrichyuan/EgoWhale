@@ -7,9 +7,12 @@ from egowhale.robots import ROBOT_NAMES, load_robot
 FRAME_QUANTUM = 8
 
 
-def episode_capacity(robot, batch_size):
+def episode_capacity(robot, batch_size, options=None):
     robot = load_robot(robot) if isinstance(robot, str) else robot
-    cost = sum(len(core._offset_grid(g.bounds)) for g in robot.groups)
+    if options is None:
+        from egowhale.action.keyframe_ik import SearchOptions
+        options = SearchOptions()
+    cost = options.episode_cost(len(robot.groups))
     if type(batch_size) is not int or batch_size < cost or batch_size % cost:
         raise ValueError(f"batch_size must be a positive multiple of {cost} for {robot.name}")
     return batch_size // cost
@@ -19,11 +22,20 @@ class EpisodeStream:
     """Bounded slots keyed by caller tokens. Knows neither Ray nor paths nor writers."""
 
     def __init__(self, robot, batch_size, backend=None):
-        self.capacity = episode_capacity(robot, batch_size)
+        if isinstance(robot, str):
+            robot = load_robot(robot)
         if backend is None:
-            from egowhale.action.sequential_ik import CuroboBackend
+            from egowhale.action.keyframe_ik import KeyframeBackend, SearchOptions
 
-            backend = CuroboBackend(robot, self.capacity)
+            options = SearchOptions()
+            self.capacity = episode_capacity(robot, batch_size, options)
+            backend = KeyframeBackend(robot, self.capacity, options)
+        else:
+            # Injected backends keep their own grid and budget (e.g. recovery tools).
+            cost = sum(len(core._offset_grid(g.bounds)) for g in robot.groups)
+            if type(batch_size) is not int or batch_size < cost or batch_size % cost:
+                raise ValueError(f"batch_size must be a positive multiple of {cost} for {robot.name}")
+            self.capacity = batch_size // cost
         self.backend = backend
         self.active = {}
 
@@ -123,11 +135,11 @@ def main():
             parser.error("--episodes must uniquely identify every input episode")
     args.out.mkdir(parents=True, exist_ok=False)
 
+    reader = core.BaseIK(robot=args.robot)
+
     def inputs():
         for index, path in enumerate(args.inputs):
-            data = core.read_gripper(path)
-            if sources:
-                data["camera_size"] = core.camera_size(sources[keys[index]])
+            data = reader.read(sources[keys[index]], path) if sources else core.read_gripper(path)
             yield index, data
 
     for row in iter_results(robot, inputs(), args.batch_size):

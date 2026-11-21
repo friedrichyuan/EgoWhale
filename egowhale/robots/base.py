@@ -23,6 +23,9 @@ class SolveGroup:
     reach: float
     bounds: np.ndarray
     batch_key: str | None = None  # Asset declaration: identical ordered kinematics across groups.
+    # Optional published rates, indexed by joints, separate from synthetic geometry/config limits.
+    rated_velocity: np.ndarray | None = None
+    rated_acceleration: np.ndarray | None = None
 
     def seed(self, position, valid):
         usable = valid.all(axis=1) if valid.all(axis=1).any() else valid.any(axis=1)
@@ -115,8 +118,13 @@ class Robot(ABC):
     def place_camera(self, model, intrinsic, height):
         cam = model.camera(self.camera)
         cam.pos[:] = 0.
-        cam.quat[:] = Rotation.from_matrix(np.diag([1., -1., -1.])).as_quat()[[3, 0, 1, 2]]
+        cam.quat[:] = (0., 1., 0., 0.)
         cam.fovy[0] = float(np.degrees(2. * np.arctan(height / (2. * float(intrinsic[1, 1])))))
+
+    def camera_track(self, camera_to_world):
+        """Convert OpenCV camera transforms to MuJoCo position and wxyz quaternion."""
+        rotations = camera_to_world[:, :3, :3] * np.array([1., -1., -1.])
+        return camera_to_world[:, :3, 3], Rotation.from_matrix(rotations).as_quat()[:, [3, 0, 1, 2]]
 
     def quality_model(self):
         spec = self.scene_spec()

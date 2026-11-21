@@ -46,12 +46,12 @@ def job(i):
 def test_capacity_and_config(tmp_path):
     from egowhale.config import ConfigError, load
 
-    assert module.episode_capacity("piper", 1296) == 8
-    assert module.episode_capacity("arx", 1296) == 16
+    assert module.episode_capacity("piper", 2160) == 8
+    assert module.episode_capacity("arx", 2160) == 16
     with pytest.raises(ValueError):
         module.episode_capacity("piper", 200)
     p = tmp_path / "c.yaml"
-    p.write_text("robot: piper\nepisodes: a.hdf5\nnodes: {action: {batch_size: 1296}}\nmemory: {inflight: 7}\n")
+    p.write_text("robot: piper\nepisodes: a.hdf5\nnodes: {action: {batch_size: 2160}}\nmemory: {inflight: 7}\n")
     with pytest.raises(ConfigError, match="inflight"):
         load(p)
 

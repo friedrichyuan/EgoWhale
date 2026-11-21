@@ -100,7 +100,12 @@ def save_base(dst: Path, result: dict) -> None:
     dst = Path(dst)
     base_path = dst / BASE
     base_path.parent.mkdir(parents=True, exist_ok=True)
-    base_path.write_text(json.dumps({"bases": {n: m.tolist() for n, m in result["bases"].items()}, "losses": result["losses"], "group_losses": result["group_losses"]}, indent=2))
+    record = {"bases": {n: m.tolist() for n, m in result["bases"].items()}, "losses": result["losses"],
+              "group_losses": result["group_losses"]}
+    for name in ("base_frame", "pair_constraints_met", "motion_model"):
+        if name in result:
+            record[name] = result[name]
+    base_path.write_text(json.dumps(record, indent=2))
     np.savez_compressed(dst / IK, joint_names=result["joint_names"], joint_positions=result["joint_positions"], fps=np.float32(data_fps(result)))
 
 

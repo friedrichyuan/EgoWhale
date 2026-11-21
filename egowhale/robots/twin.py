@@ -29,6 +29,8 @@ def _origin(joint, position, rotation):
 
 
 class TwinMJCF(Robot):
+    rated_velocity = None
+    rated_acceleration = None
     tcp_sites = ("left_tcp", "right_tcp")
 
     @property
@@ -129,7 +131,8 @@ class TwinMJCF(Robot):
                            "null_space_weight": [1.] * len(joints), "cspace_distance_weight": [1.] * len(joints),
                            "max_acceleration": 15., "max_jerk": 500.}}}}
             result.append(SolveGroup(side, (i,), joints, tools, config, lower, upper, home.copy(),
-                                     self.reach, _SEARCH_BOUNDS.copy(), batch_key=self.name))
+                                     self.reach, _SEARCH_BOUNDS.copy(), batch_key=self.name,
+                                     rated_velocity=self.rated_velocity, rated_acceleration=self.rated_acceleration))
         return tuple(result)
 
     def body_side(self, name):
@@ -157,6 +160,9 @@ class FrankaRobot(TwinMJCF):
     arm_joints = tuple(f"joint{i}" for i in range(1, 8))
     gripper_bodies = ("left_finger", "right_finger")
     reach = .955
+    # FER (not FR3) published limits, in arm_joints order.
+    rated_velocity = np.array([2.175] * 4 + [2.61] * 3)
+    rated_acceleration = np.array([15., 7.5, 10., 12.5, 15., 20., 20.])
 
     def gripper_positions(self, width, valid):
         opening = np.where(valid, np.clip(width / 2., 0., .04), 0.)
@@ -172,6 +178,7 @@ class UR5eRobot(TwinMJCF):
     gripper_bodies = tuple(f"{side}_{body}" for side in _SIDES for body in
                            ("driver", "coupler", "spring_link", "follower", "pad", "silicone_pad"))
     reach = .99
+    rated_velocity = np.full(6, np.pi)  # UR5e published max joint speed: 180 deg/s.
 
     @cached_property
     def _gripper_calibration(self):

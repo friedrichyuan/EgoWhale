@@ -80,7 +80,7 @@ def validate_prediction_input(src: Path, dst: Path, options: dict | None = None)
             raise ValueError('WiLoR NPZ/metadata mismatch')
         validate_legacy_prediction(result, meta.get('frames'), require_positive_depth=meta.get('source') != 'ego2robot_sync')
     if meta.get('retarget_hdf5'):
-        validate_retarget(Path(dst), meta['signature'], meta['frames'])
+        validate_retarget(Path(dst), meta['signature'], meta['frames'], hdf5=meta['retarget_hdf5'])
     marked = meta.get('calibration_input')
     if marked is not None and file_identity(Path(marked['path'])) != marked:
         raise ValueError('WiLoR calibration input changed; use a new output directory')
@@ -220,7 +220,7 @@ class WiLoR(Step):
                 raise ValueError('WiLoR NPZ/metadata mismatch')
             validate_legacy_prediction(result, marked.get('frames'), require_positive_depth=marked.get('source') != 'ego2robot_sync')
         if marked.get('retarget_hdf5'):
-            validate_retarget(Path(dst), marked['signature'], marked['frames'])
+            validate_retarget(Path(dst), marked['signature'], marked['frames'], hdf5=marked['retarget_hdf5'])
 
     def load(self):
         if not self.python.is_file():

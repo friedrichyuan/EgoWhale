@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from egowhale.wilor.retarget_export import collect_retarget, export_existing
+from egowhale.wilor.retarget_export import export_existing
 
 
 def main() -> int:
@@ -26,9 +26,7 @@ def main() -> int:
 
     def export(job):
         try:
-            export_existing(job)
-            hdf5 = collect_retarget(root / "retarget_inputs", job.name, job)
-            return str(hdf5), ""
+            return str(export_existing(job)), ""
         except (KeyError, OSError, ValueError) as error:
             return "", str(error)
 
@@ -39,7 +37,7 @@ def main() -> int:
         writer.writerow(("job", "retarget_hdf5", "error"))
         writer.writerows((job.name, hdf5, error) for job, (hdf5, error) in zip(jobs, results, strict=True))
     failed = sum(bool(error) for _, error in results)
-    print(f"{len(jobs) - failed}/{len(jobs)} exported to {root / 'retarget_inputs'}")
+    print(f"{len(jobs) - failed}/{len(jobs)} exported under {root}")
     return int(failed != 0)
 
 

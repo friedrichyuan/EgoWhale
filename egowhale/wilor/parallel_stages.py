@@ -289,7 +289,7 @@ def execute(request, experiment, models):
         with closing(rgb_frames(video)) as frames:
             processor._save_hand_overlay_video(frames, hands, None, height, width, fps=fps, frame_count=count)
         experiment.finish(work, "full", "b", "da3", status, expected_frames=count)
-        publish(source, dst, work, request["signature"])
+        publish(source, dst, work, request["signature"], retarget_hdf5=request["retarget_hdf5"])
         from egowhale.wilor.step import validate_prediction_input
         validate_prediction_input(source, dst)
     else:

@@ -38,6 +38,9 @@ class FakeResident:
         (work / 'input.json').write_text(json.dumps({'frames': 10}))
         (work / 'annotation_counts.json').write_text(json.dumps({'left': 5, 'right': 0}))
         (output / 'action/hands_wilor.npz').write_bytes(b'hand')
+        hdf5 = output / request['retarget_hdf5']
+        hdf5.write_bytes(b'data')
+        hdf5.with_suffix('.mp4').symlink_to(source)
         return 0
 
     def close(self):
@@ -77,6 +80,11 @@ split:
             summary = json.loads((output / 'throughput.json').read_text())
             self.assertEqual((summary['success'], summary['failed_or_interrupted'], summary['successful_frames']), (2, 2, 20))
             self.assertEqual(len(list((output / 'final_videos').glob('*.mp4'))), 2)
+            for success in ('0', '3'):
+                hdf5 = Path(rows[success]['retarget_hdf5'])
+                self.assertEqual(hdf5.parent.parent, output)
+                self.assertEqual(hdf5.with_suffix('.mp4').resolve(), inputs / f'{success}.mp4')
+                self.assertEqual(Path(rows[success]['video']).parent, output / 'final_videos')
 
 
 if __name__ == '__main__':

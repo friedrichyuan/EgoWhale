@@ -9,12 +9,13 @@ import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
 
 from egowhale.wilor.parallel_stages import execute, read_candidates, save_candidates
+from egowhale.wilor.retarget_export import BATCH_RETARGET_HDF5, export_existing
 from egowhale.wilor.synced import CONFIG, RUNNER, identity
 from egowhale.wilor.pipeline.hmp import windows
 
@@ -84,7 +85,7 @@ class WiLoRParallelTests(unittest.TestCase):
             row.cam_t = [0, 0, .6]
             save_candidates(([row] for _ in range(8)), root / "candidates", 8, False)
             run("basic", candidates=str(root / "candidates"))
-            run("publish")
+            run("publish", retarget_hdf5=BATCH_RETARGET_HDF5)
             with np.load(dst / "action/hands_wilor.npz") as data:
                 np.testing.assert_array_equal(data["frame_index"], np.arange(8))
                 np.testing.assert_allclose(data["timestamps"], np.arange(8) / 18)
@@ -93,7 +94,7 @@ class WiLoRParallelTests(unittest.TestCase):
                 np.testing.assert_allclose(data["joints_camera"][:, 1, :, 2], .3)
                 from egowhale.action.retarget import read_episode
 
-                hdf5 = dst / "action/hands_wilor.hdf5"
+                hdf5 = dst / BATCH_RETARGET_HDF5
                 exported = read_episode(hdf5)
                 np.testing.assert_array_equal(exported["intrinsic"], data["intrinsic"])
                 np.testing.assert_array_equal(exported["camera"], np.broadcast_to(np.eye(4), (8, 4, 4)))
@@ -103,6 +104,18 @@ class WiLoRParallelTests(unittest.TestCase):
                     self.assertTrue(np.isnan(exported["joints"]["left" + joint][:, :3, 3]).all())
                 self.assertEqual(hdf5.with_suffix(".mp4").resolve(), source)
             self.assertEqual(json.loads((work / "annotation_counts.json").read_text())["right"], 8)
+            self.assertEqual(export_existing(dst), hdf5)
+            (root / "final_videos").mkdir()
+            job = Job(1, source, dst, args["identity"], args["signature"], done={"publish": root / "publish"})
+            batch = Batch({}, {"cards": {}, "required": False}, CONFIG, Path(sys.executable), root, [job], False, {})
+            writer = Mock()
+            batch.record(job, writer)
+            row = writer.writerow.call_args.args[0]
+            self.assertEqual(Path(row["retarget_hdf5"]), hdf5)
+            self.assertEqual(Path(row["video"]).parent, root / "final_videos")
+            self.assertEqual(Path(row["video"]).resolve(), work / "optimized_hand_points.mp4")
+            self.assertFalse((root / "retarget_inputs").exists())
+            self.assertEqual(list(root.rglob("*.hdf5")), [hdf5])
 
     def test_hmp_window_ranges(self):
         self.assertEqual(windows(127), [(0, 127)])

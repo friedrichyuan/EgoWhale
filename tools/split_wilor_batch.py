@@ -16,6 +16,8 @@ import time
 from omegaconf import OmegaConf
 from batch_wilor_ego2robot import ROOT, ResidentClient, discover, safe_name
 
+DEFAULT_OUTPUT_ROOT = 'outputs/wilor_output'
+
 
 def path_at_root(value):
     path = Path(value).expanduser()
@@ -29,7 +31,7 @@ def launch_parallel(document, args, parser):
 
     cfg = document.split
     input_dir = path_at_root(cfg.input_dir)
-    output_root = path_at_root(cfg.output_root)
+    output_root = path_at_root(cfg.get('output_root', DEFAULT_OUTPUT_ROOT))
     python = args.python.expanduser().resolve()
     maximum = args.max_videos if args.max_videos is not None else int(cfg.get("max_videos", 0))
     if maximum < 0 or float(cfg.get("heartbeat_seconds", 10)) <= 0:
@@ -64,7 +66,8 @@ def main():
     all_gpus = camera_gpus + hand_gpus
     if not camera_gpus or not hand_gpus or any(not x.isdigit() for x in all_gpus) or len(set(all_gpus)) != len(all_gpus):
         parser.error('camera_gpus / wilor_gpus 必须均非空，且数字 GPU 编号不能重复')
-    input_dir, output_root = path_at_root(cfg.input_dir), path_at_root(cfg.output_root)
+    input_dir = path_at_root(cfg.input_dir)
+    output_root = path_at_root(cfg.get('output_root', DEFAULT_OUTPUT_ROOT))
     pipeline_config = args.config.resolve() if 'split' in document else path_at_root(cfg.pipeline_config)
     python = args.python.expanduser().resolve()
     if not input_dir.is_dir() or not pipeline_config.is_file() or not python.is_file():
@@ -84,6 +87,7 @@ def main():
         parser.error('没有找到 MP4 视频')
     print(f'分卡配置：DA3={camera_gpus} | WiLoR={hand_gpus} | 视频={len(videos)} | 待处理容量={capacity}', flush=True)
     if args.dry_run:
+        print(f'输出目录：{output_root}')
         for index, video in enumerate(videos, 1):
             print(f'{index}/{len(videos)} {video}')
         return 0
@@ -91,6 +95,10 @@ def main():
     run_root = output_root / f'split_{stamp}_{os.getpid()}'
     run_root.mkdir(parents=True)
     (run_root / 'final_videos').mkdir()
+    print(f'批次输出目录：{run_root}', flush=True)
+    sys.path.insert(0, str(ROOT))
+    from egowhale.wilor.retarget_export import BATCH_RETARGET_HDF5
+
     jobs = []
     for index, video in enumerate(videos, 1):
         name = f'{index:05d}_{safe_name(video.parent.name)}_{safe_name(video.stem)}_{stamp}'
@@ -105,16 +113,18 @@ def main():
     for job in jobs:
         camera_queue.put(job)
     rows = []
-    fields = ('index', 'source', 'status', 'camera_gpu', 'wilor_gpu', 'frames', 'video', 'camera_log', 'wilor_log', 'error')
+    fields = ('index', 'source', 'status', 'camera_gpu', 'wilor_gpu', 'frames', 'video',
+              'retarget_hdf5', 'camera_log', 'wilor_log', 'error')
     results = (run_root / 'results.csv').open('w', encoding='utf-8-sig', newline='')
     writer = csv.DictWriter(results, fieldnames=fields)
     writer.writeheader(); results.flush()
     started = time.monotonic()
 
-    def record(job, status, error='', video='', frames=''):
+    def record(job, status, error='', video='', frames='', hdf5=''):
         row = {'index': job['index'], 'source': str(job['video']), 'status': status,
                'camera_gpu': job.get('camera_gpu', ''), 'wilor_gpu': job.get('wilor_gpu', ''),
-               'frames': frames, 'video': str(video), 'camera_log': str(job['output'] / 'camera.log'),
+               'frames': frames, 'video': str(video), 'retarget_hdf5': str(hdf5),
+               'camera_log': str(job['output'] / 'camera.log'),
                'wilor_log': str(job['output'] / 'wilor.log'), 'error': error}
         with lock:
             rows.append(row); writer.writerow(row); results.flush()
@@ -145,7 +155,8 @@ def main():
                     log = job['output'] / ('camera.log' if stage == 'camera' else 'wilor.log')
                     prog = job['output'] / ('camera_progress.json' if stage == 'camera' else 'wilor_progress.json')
                     code = client.request({'video': str(job['video']), 'output': str(job['output']),
-                        'config': str(pipeline_config), 'stage': stage, 'label': label, 'progress_file': str(prog)},
+                        'config': str(pipeline_config), 'stage': stage, 'label': label, 'progress_file': str(prog),
+                        'retarget_hdf5': BATCH_RETARGET_HDF5},
                         log, label, prog)
                     if code:
                         record(job, f'{tag}失败' if not stop.is_set() else '中断', f'worker 退出码 {code}，查看日志')
@@ -162,13 +173,16 @@ def main():
                     else:
                         work = job['output'] / 'action/wilor_ego2robot'
                         video = work / 'optimized_hand_points.mp4'
-                        if not video.is_file() or not video.stat().st_size or not (job['output'] / 'action/hands_wilor.npz').is_file():
+                        hdf5 = job['output'] / BATCH_RETARGET_HDF5
+                        expected = (video, hdf5, hdf5.with_suffix('.mp4'), job['output'] / 'action/hands_wilor.npz')
+                        if any(not path.is_file() or not path.stat().st_size for path in expected):
                             raise ValueError('WiLoR 输出不完整')
                         info = json.loads((work / 'input.json').read_text())
                         counts = json.loads((work / 'annotation_counts.json').read_text())
                         link = run_root / 'final_videos' / f"{job['output'].name}.mp4"
                         link.symlink_to(os.path.relpath(video, link.parent))
-                        record(job, '成功' if any(counts.values()) else '成功（无可见手部标注）', video=video, frames=info['frames'])
+                        record(job, '成功' if any(counts.values()) else '成功（无可见手部标注）',
+                               video=link, frames=info['frames'], hdf5=hdf5)
                 except Exception as exc:
                     record(job, '失败', f'{type(exc).__name__}: {exc}')
                     client.close()

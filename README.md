@@ -87,14 +87,20 @@ Run hand reconstruction on a directory of MP4 files across multiple GPUs.
 bash scripts/wilor_multigpu.sh
 ```
 
+By default, each run writes to `outputs/wilor_output/parallel_<run_id>/`.
+
+- `final_videos/` contains the annotated MP4s for review.
+- Each video has a directory such as `00001_task_clip/` with a `hands_wilor.hdf5` file and a matching `hands_wilor.mp4` link to the original video.
+- `results.csv` lists the processing status and the paths to the annotated video and HDF5 for each input.
+
 > [!TIP]
 >
 > Edit [`wilor.yaml`](egowhale/wilor/cfgs/wilor.yaml) to configure hand reconstruction.
 >
 > - **Temporal refinement** defaults to off. Set `dynhamr_enabled: true` to enable SAM 3 hand masking and DynHaMR/HMP refinement.
 > - **Minimum per-hand frame coverage** is controlled by `min_hand_detection_rate` in basic mode. Each hand must meet the threshold independently before and after filtering. The default `0.10` requires detections in at least 10% of the clip's frames. Set `0.20` to require 20%.
-> - **Multi-GPU scheduling** uses physical GPU indices. Set `split.input_dir` and `split.output_root`. With refinement off, `split.profiles.basic` assigns `camera_gpus` to DA3 and `wilor_gpus` to WiLoR. With refinement on, `split.profiles.refined` also assigns `mask_gpus` to SAM 3 and `optimizer_gpus` to DynHaMR/HMP. GPU lists must be disjoint within each profile.
-> - **Batch output** includes annotated videos in `final_videos/` and HDF5/MP4 pairs in `retarget_inputs/`. Set `SPLIT_CONFIG` when launching the batch script to use a separate experiment YAML.
+> - **Multi-GPU scheduling** uses physical GPU indices. With refinement off, `split.profiles.basic` assigns `camera_gpus` to DA3 and `wilor_gpus` to WiLoR. With refinement on, `split.profiles.refined` also assigns `mask_gpus` to SAM 3 and `optimizer_gpus` to DynHaMR/HMP. GPU lists must be disjoint within each profile.
+> - **Batch paths** are configured with `split.input_dir` and `split.output_root`. Set `SPLIT_CONFIG` when launching the batch script to use a separate experiment YAML.
 
 ## Run a Corpus
 

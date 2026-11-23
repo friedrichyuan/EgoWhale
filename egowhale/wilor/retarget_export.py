@@ -12,6 +12,7 @@ import numpy as np
 
 RETARGET_HDF5 = "action/hands_wilor.hdf5"
 RETARGET_VIDEO = "action/hands_wilor.mp4"
+BATCH_RETARGET_HDF5 = "hands_wilor.hdf5"
 
 # WiLoR uses OpenPose order: wrist, thumb, index, middle, ring, little.
 JOINT_NAMES = (
@@ -21,13 +22,15 @@ JOINT_NAMES = (
 )
 
 
-def export_retarget(dst: Path, result: dict, source: Path, signature: str) -> Path:
+def export_retarget(
+    dst: Path, result: dict, source: Path, signature: str, *, hdf5: str = RETARGET_HDF5,
+) -> Path:
     """Write positional transforms with an identity camera for camera-frame joints."""
     source = source.resolve(strict=True)
     if source.suffix.lower() != ".mp4":
         raise ValueError(f"Retarget export needs the source MP4, got {source}")
-    path = dst / RETARGET_HDF5
-    video = dst / RETARGET_VIDEO
+    path = dst / hdf5
+    video = path.with_suffix(".mp4")
     path.parent.mkdir(parents=True, exist_ok=True)
 
     points = np.asarray(result["joints_camera"], dtype=np.float32)
@@ -75,10 +78,10 @@ def export_retarget(dst: Path, result: dict, source: Path, signature: str) -> Pa
     return path
 
 
-def validate_retarget(dst: Path, signature: str, frames: int) -> None:
+def validate_retarget(dst: Path, signature: str, frames: int, *, hdf5: str = RETARGET_HDF5) -> None:
     """Check that the published HDF5 and sibling video belong to this prediction."""
-    path = dst / RETARGET_HDF5
-    if not path.is_file() or not (dst / RETARGET_VIDEO).is_file():
+    path = dst / hdf5
+    if not path.is_file() or not path.with_suffix(".mp4").is_file():
         raise ValueError(f"Incomplete WiLoR Retarget export: {path}")
     with h5py.File(path, "r") as handle:
         if (handle.attrs.get("wilor_signature") != signature
@@ -87,24 +90,12 @@ def validate_retarget(dst: Path, signature: str, frames: int) -> None:
             raise ValueError(f"WiLoR Retarget export does not match its NPZ: {path}")
 
 
-def collect_retarget(directory: Path, name: str, job: Path) -> Path:
-    """Link a unique HDF5/MP4 pair into a batch's Retarget input directory."""
-    directory.mkdir(exist_ok=True)
-    for artifact in (RETARGET_HDF5, RETARGET_VIDEO):
-        target = (job / artifact).resolve(strict=True)
-        link = directory / (name + target.suffix.lower())
-        if link.is_symlink():
-            if link.resolve() != target:
-                raise ValueError(f"Retarget input already points to another episode: {link}")
-        else:
-            link.symlink_to(os.path.relpath(target, directory))
-    return directory / f"{name}.hdf5"
-
-
 def export_existing(job: Path) -> Path:
     """Add a Retarget export to a completed WiLoR output without re-running inference."""
     action = job / "action"
     metadata = json.loads((action / "hands_wilor.json").read_text())
+    # Re-export in place when a previous run already published a pair.
+    hdf5 = metadata.get("retarget_hdf5") or RETARGET_HDF5
     source = Path(metadata["input"]["path"])
     stat = source.stat()
     if (stat.st_size, stat.st_mtime_ns) != (metadata["input"]["size"], metadata["input"]["mtime_ns"]):
@@ -113,4 +104,4 @@ def export_existing(job: Path) -> Path:
         sig = metadata["signature"]
         if str(result["signature"]) != sig or len(result["valid"]) != metadata["frames"]:
             raise ValueError(f"WiLoR NPZ/metadata mismatch: {job}")
-        return export_retarget(job, result, source, sig)
+        return export_retarget(job, result, source, sig, hdf5=hdf5)

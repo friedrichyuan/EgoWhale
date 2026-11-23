@@ -7,7 +7,7 @@
 # 同一视频在独立的 GPU 角色间并行。每张物理 GPU 分给一个角色。
 split:
   input_dir: datasets/egodex_fixed500_18fps
-  output_root: outputs/wilor_split_gpu_experiment
+  output_root: outputs/wilor_output
   profiles:
     basic:
       camera_gpus: [0, 1, 2]

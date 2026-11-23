@@ -16,7 +16,7 @@ import time
 import uuid
 
 from batch_wilor_ego2robot import ROOT, ResidentClient, safe_name
-from egowhale.wilor.retarget_export import RETARGET_HDF5, RETARGET_VIDEO, collect_retarget
+from egowhale.wilor.retarget_export import BATCH_RETARGET_HDF5, RETARGET_HDF5
 
 ROLE = {"prepare": "prepare", "camera": "camera", "candidates": "wilor",
         "masks": "mask", "tracks": "postprocess", "optimizer_input": "postprocess",
@@ -41,6 +41,7 @@ class Job:
     output: Path
     identity: dict
     signature: str
+    retarget_hdf5: str = BATCH_RETARGET_HDF5
     done: dict = field(default_factory=dict)
     submitted: set = field(default_factory=set)
     params: dict = field(default_factory=dict)
@@ -116,6 +117,8 @@ class Batch:
         key = key or stage
         if key in job.submitted or job.error:
             return
+        if stage == "publish":
+            args["retarget_hdf5"] = job.retarget_hdf5
         job.submitted.add(key)
         self.ready[ROLE[stage]].append(Task(job, stage, key, args))
 
@@ -155,6 +158,7 @@ class Batch:
         if code == 0:
             work = job.output / "action/wilor_ego2robot"
             hands = work / "hand_processor"
+            hdf5 = job.output / job.retarget_hdf5
             outputs = {
                 "prepare": [work / "input.json", work / "video_L.mp4"],
                 "camera": [work / name for name in ("cam_intrinsics.json", "cam_extrinsics.npz", "da3_samples.json")],
@@ -172,7 +176,7 @@ class Batch:
                           *[hands / f"hand_data_{side}.npz" for side in ("left", "right")]],
                 "raw_video": [hands / "video_hand_overlay_anyhand.mp4"],
                 "publish": [job.output / "action/hands_wilor.npz", job.output / "action/hands_wilor.json",
-                            job.output / RETARGET_HDF5, job.output / RETARGET_VIDEO,
+                            hdf5, hdf5.with_suffix(".mp4"),
                             work / "full_completed.json", work / "optimized_hand_points.mp4", work / "annotation_counts.json"],
             }[stage]
             if not outputs or any(not p.is_file() or p.stat().st_size == 0 for p in outputs):
@@ -316,13 +320,13 @@ class Batch:
         if "publish" in job.done and not job.error:
             counts = json.loads((work / "annotation_counts.json").read_text())
             result = json.loads((work / "full_completed.json").read_text())["optimization"]
-            row.update(frames=json.loads((work / "input.json").read_text())["frames"], video=str(video),
-                       status="成功" if any(counts.values()) else "成功（无可见手部标注）",
-                       result_source=result["result_source"])
-            row["retarget_hdf5"] = str(collect_retarget(self.root / "retarget_inputs", job.output.name, job.output))
             link = self.root / "final_videos" / f"{job.output.name}.mp4"
             if not link.is_symlink():
                 link.symlink_to(os.path.relpath(video, link.parent))
+            row.update(frames=json.loads((work / "input.json").read_text())["frames"], video=str(link),
+                       retarget_hdf5=str(job.output / job.retarget_hdf5),
+                       status="成功" if any(counts.values()) else "成功（无可见手部标注）",
+                       result_source=result["result_source"])
         self.rows.append(row)
         writer.writerow(row)
         print(f"[{job.index}/{self.total}] {row['status']} {row['source']} {row['error']}", flush=True)
@@ -445,24 +449,29 @@ def run_parallel(document, args, videos, output_root, config, python, parser):
         parser.error("长视频预算或 HMP 重叠长度无效")
     print(f"WiLoR {profile_name} | GPUs {cards} | 视频 {len(videos)} | 长视频配置 {long_video}")
     if args.dry_run:
+        print(f"输出目录：{args.resume_run.resolve() if args.resume_run else output_root}")
         for index, video in enumerate(videos, 1):
             print(f"{index}/{len(videos)} {video}")
         return 0
 
     root = args.resume_run.resolve() if args.resume_run else output_root / (
         datetime.now().astimezone().strftime("parallel_%Y%m%d_%H%M%S_%f") + f"_{os.getpid()}")
-    jobs = [Job(i, video, root / f"{i:05d}_{safe_name(video.parent.name)}_{safe_name(video.stem)}",
-                identity(video), signature(video, config, None, "da3", .3))
-            for i, video in enumerate(videos, 1)]
-    manifest = {"profile": profile_name, "videos": [job.identity for job in jobs]}
+    identities = [identity(video) for video in videos]
+    manifest = {"profile": profile_name, "videos": identities}
+    retarget_hdf5 = BATCH_RETARGET_HDF5
     if args.resume_run:
-        if json.loads((root / "manifest.json").read_text()) != manifest:
+        previous = json.loads((root / "manifest.json").read_text())
+        retarget_hdf5 = previous.pop("retarget_hdf5", RETARGET_HDF5)
+        if retarget_hdf5 not in (BATCH_RETARGET_HDF5, RETARGET_HDF5) or previous != manifest:
             parser.error("恢复批次的模式、视频清单和源文件须与原运行一致")
     else:
         root.mkdir(parents=True)
         (root / "final_videos").mkdir()
-        write_json(root / "manifest.json", manifest)
+        write_json(root / "manifest.json", {**manifest, "retarget_hdf5": retarget_hdf5})
 
+    jobs = [Job(i, video, root / f"{i:05d}_{safe_name(video.parent.name)}_{safe_name(video.stem)}",
+                source, signature(video, config, None, "da3", .3), retarget_hdf5=retarget_hdf5)
+            for i, (video, source) in enumerate(zip(videos, identities, strict=True), 1)]
     batch = Batch(options, {"cards": cards, "required": bool(document.get("dynhamr_required", False))},
                   config, python, root, jobs, refined, long_video)
     import fcntl
@@ -471,4 +480,5 @@ def run_parallel(document, args, videos, output_root, config, python, parser):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             parser.error(f"已有进程处理此批次：{root}")
+        print(f"批次输出目录：{root}", flush=True)
         return batch.run()

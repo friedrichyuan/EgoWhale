@@ -15,6 +15,7 @@ import traceback
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from egowhale.wilor.retarget_export import RETARGET_HDF5
 from egowhale.wilor.synced import CONFIG, RUNNER, SYNC_ROOT, identity, run
 from egowhale.wilor.step import WiLoR
 
@@ -86,7 +87,8 @@ def main():
                         print('已接收 DA3 结果，开始 WiLoR', flush=True)
                     return experiment.main([*args, '--prechecked'], resident=models)
 
-                run(src, dst, config, Path(sys.executable), 'da3', None, .3, runner=execute)
+                run(src, dst, config, Path(sys.executable), 'da3', None, .3, runner=execute,
+                    retarget_hdf5=request.get('retarget_hdf5', RETARGET_HDF5))
                 node.validate_outputs(src, dst)
                 response = {'ok': True}
             except Exception as exc:

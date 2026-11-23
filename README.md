@@ -9,9 +9,10 @@
 </p>
 
 <p align="center">
+  <a href="docs/installation.md">Installation</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#run-one-stage">Run One Stage</a> ·
-  <a href="#run-a-corpus">Run a Corpus</a> 
+  <a href="#run-a-corpus">Run a Corpus</a>
 </p>
 
 <p align="center">
@@ -27,54 +28,46 @@ EgoWhale is a modular pipeline for synthesizing robot demonstrations from egocen
 
 ## Examples
 
-Reference synthesis examples from the upstream **Ego2Robot** project:
+EgoWhale synthesizes demonstrations for four robot platforms. From top to bottom, the examples show Piper coloring, Franka cleaning cups, UR5e raking a sand garden, and ARX ACone handling an AirPods charging case.
 
 <p align="center">
-  <a href="https://www-ye.github.io/ego2robot_blog/assets/ego2robot_video.mp4">
-    <img src="https://www-ye.github.io/ego2robot_blog/assets/fig_ego2r_realplay_gallery.png" alt="Upstream Ego2Robot examples: egocentric play videos converted into ARX ACone synthetic demonstrations" width="100%">
-  </a>
+  <img src="docs/four_bodies.jpg" alt="EgoWhale synthesis examples for Piper, Franka, UR5e, and ARX ACone" width="100%">
 </p>
-
-
 
 ## Quick Start
 
-See the [installation guide](docs/installation.md) for the CUDA environment, model weights, and robot assets. The main pipeline uses Python 3.12+ and MuJoCo EGL rendering on Linux.
+Follow the [installation guide](docs/installation.md) to set up Python, CUDA, model weights, and robot assets on Linux.
 
 ```bash
 git clone https://github.com/friedrichyuan/EgoWhale.git
 cd EgoWhale
-python -m pip install -e .
 ```
 
-After preparing the resources in the installation guide, run an EgoDex episode:
+After setup, run an annotated episode. Keep the HDF5 and MP4 together with the same filename stem and frame count.
 
 ```bash
-# Keep episode.hdf5 and episode.mp4 in the same directory.
-python -m egowhale path/to/episode.hdf5 outputs/demo
+MUJOCO_GL=egl python -m egowhale path/to/episode.hdf5 outputs/demo
 ```
 
 The final video is saved to `outputs/demo/visual/composite.mp4`, with the quality report at `outputs/demo/action/quality.json`. Omitting the output directory uses `outputs/<task>/<episode>/`.
 
 > [!TIP]
 >
-> 1. The full pipeline uses **EgoDex HDF5 + a same-name MP4** with matching frame counts and targets **ARX ACone**. 
-> 2. Enable **DynHaMR temporal refinement** on Path B with `dynhamr_enabled: true` in the [hand config](egowhale/wilor/cfgs/wilor_hand_pipeline.yaml). It can improve smoothness and temporal consistency, is **off by default**, and requires additional dependencies and computation.
-> 3. **STTN** is the default inpainter. After installing **ProPainter** and its weights, switch with `--inpaint-model propainter`, or set `nodes.inpaint.model: propainter` in a batch config.
-> 4. **VLM auditing is optional.** In single-episode runs, set `EGOWHALE_VLM_API_KEY` to let Curate audit eligible episodes using Qwen by default. Without a key, the audit is marked `skipped`; API failures are recorded as `error` and do not by themselves fail the episode. **Ray batch runs disable this audit.
-
+> - **ARX ACone** is the default robot. With the corresponding assets installed, select `--robot piper`, `--robot franka`, or `--robot ur5e`.
+> - **STTN** is the default inpainter. Select ProPainter with `--inpaint-model propainter` for a single episode or `nodes.inpaint.model: propainter` in the Ray YAML.
+> - **VLM auditing** is optional for single-episode runs. Set `EGOWHALE_VLM_API_KEY` to let Curate audit eligible episodes with Qwen. Ray batches skip this audit.
 
 ## Run One Stage
 
-Each stage can be launched independently. Run these commands from the repository root; upstream outputs must already exist for stages that need them.
+Run the stage scripts from the repository root. For an annotated episode, pass its HDF5 and point the stage at an output directory containing any required upstream results.
 
 ```bash
-bash scripts/<stage>.sh path/to/episode.hdf5 [out_dir]
+bash scripts/retarget.sh path/to/episode.hdf5 outputs/demo
 ```
 
 | Stage | Script | Main output |
 | --- | --- | --- |
-| Hand reconstruction | `scripts/wilor.sh` | `action/hands_wilor.npz`, hand overlay |
+| Hand reconstruction (optional) | `scripts/wilor.sh` | `action/hands_wilor.hdf5`, `action/hands_wilor.npz`, hand overlay |
 | Gripper retargeting | `scripts/retarget.sh` | `action/gripper.npz` |
 | Person segmentation | `scripts/segment.sh` | `visual/masks.npz` |
 | Video inpainting | `scripts/inpaint.sh` | `visual/inpaint.mp4` |
@@ -84,11 +77,28 @@ bash scripts/<stage>.sh path/to/episode.hdf5 [out_dir]
 | Rendering + compositing | `scripts/composite.sh` | `visual/render.npz`, `visual/composite.mp4` |
 | Quality curation | `scripts/curate.sh` | `action/quality.json` |
 
+### Hand reconstruction from unlabeled video（optional）
 
+Hand reconstruction is an optional, standalone stage for MP4 videos without hand annotations. It uses DA3 to estimate camera intrinsics and AnyHand/WiLoR to predict 3D hand keypoints. For annotated episodes, start with Retarget.
+
+Run hand reconstruction on a directory of MP4 files across multiple GPUs.
+
+```bash
+bash scripts/wilor_multigpu.sh
+```
+
+> [!TIP]
+>
+> Edit [`wilor.yaml`](egowhale/wilor/cfgs/wilor.yaml) to configure hand reconstruction.
+>
+> - **Temporal refinement** defaults to off. Set `dynhamr_enabled: true` to enable SAM 3 hand masking and DynHaMR/HMP refinement.
+> - **Minimum per-hand frame coverage** is controlled by `min_hand_detection_rate` in basic mode. Each hand must meet the threshold independently before and after filtering. The default `0.10` requires detections in at least 10% of the clip's frames. Set `0.20` to require 20%.
+> - **Multi-GPU scheduling** uses physical GPU indices. Set `split.input_dir` and `split.output_root`. With refinement off, `split.profiles.basic` assigns `camera_gpus` to DA3 and `wilor_gpus` to WiLoR. With refinement on, `split.profiles.refined` also assigns `mask_gpus` to SAM 3 and `optimizer_gpus` to DynHaMR/HMP. GPU lists must be disjoint within each profile.
+> - **Batch output** includes annotated videos in `final_videos/` and HDF5/MP4 pairs in `retarget_inputs/`. Set `SPLIT_CONFIG` when launching the batch script to use a separate experiment YAML.
 
 ## Run a Corpus
 
-Use Ray to process many episodes with persistent model actors and configurable GPU/CPU pools:
+Use Ray to process many episodes with persistent model actors and configurable GPU/CPU pools.
 
 ```bash
 bash scripts/batch.sh cfgs/bench8_sttn.yaml \
@@ -99,9 +109,7 @@ bash scripts/batch.sh cfgs/bench8_sttn.yaml \
 
 `--episodes` accepts HDF5 files, dataset directories, or `.txt` lists of episode paths. Results go to `outputs/my_run/`, with `batch.jsonl` episode records and TensorBoard events in `tb/`. Configure GPU pools, shared action actors, IO queues, and memory limits in [YAML](cfgs/bench8_sttn.yaml).
 
-The supplied preset targets **8 GPUs and a high-memory host**; adapt it to your machine. `--limit 1` limits the episode count while keeping the configured resources. 
-
-
+The supplied preset targets **8 GPUs and a high-memory host**. Adjust its resources for your machine. `--limit 1` runs one episode with the configured resources.
 
 ## Acknowledgments
 

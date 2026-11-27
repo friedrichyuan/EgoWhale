@@ -1,8 +1,7 @@
 # WiLoR 唯一配置文件。路径相对于 EgoWhale 仓库根目录，GPU 编号为物理编号。
-# MP4 -> DA3 -> WiLoR；带标注的 HDF5 请直接输入 Retarget。
-#
-# 分卡运行：bash scripts/run_wilor_split_multigpu.sh
-# 单视频：bash scripts/wilor.sh /path/video.mp4 [output_dir]
+# DA3 与 WiLoR 从同一条 MP4 并行推理；带标注的 HDF5 请直接输入 Retarget。
+# 预览配置：bash scripts/wilor.sh --dry-run
+# 分卡运行：bash scripts/wilor.sh
 
 # 同一视频在独立的 GPU 角色间并行。每张物理 GPU 分给一个角色。
 split:

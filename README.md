@@ -67,7 +67,7 @@ bash scripts/retarget.sh path/to/episode.hdf5 outputs/demo
 
 | Stage | Script | Main output |
 | --- | --- | --- |
-| Hand reconstruction (optional) | `scripts/wilor.sh` | `action/hands_wilor.hdf5`, `action/hands_wilor.npz`, hand overlay |
+| Hand reconstruction (optional) | `scripts/wilor.sh` | `final_videos/*.mp4`, per-video `hands_wilor.hdf5` |
 | Gripper retargeting | `scripts/retarget.sh` | `action/gripper.npz` |
 | Person segmentation | `scripts/segment.sh` | `visual/masks.npz` |
 | Video inpainting | `scripts/inpaint.sh` | `visual/inpaint.mp4` |
@@ -81,16 +81,17 @@ bash scripts/retarget.sh path/to/episode.hdf5 outputs/demo
 
 Hand reconstruction is an optional, standalone stage for MP4 videos without hand annotations. It uses DA3 to estimate camera intrinsics and AnyHand/WiLoR to predict 3D hand keypoints. For annotated episodes, start with Retarget.
 
-Run hand reconstruction on a directory of MP4 files across multiple GPUs.
+Set the input MP4 directory, output directory, GPU roles, and temporal refinement in [wilor.yaml](egowhale/wilor/cfgs/wilor.yaml). Use the following commands to preview the configuration and run the batch.
 
 ```bash
-bash scripts/wilor_multigpu.sh
+bash scripts/wilor.sh --dry-run
+bash scripts/wilor.sh
 ```
 
 By default, each run writes to `outputs/wilor_output/parallel_<run_id>/`.
 
 - `final_videos/` contains the annotated MP4s for review.
-- Each video has a directory such as `00001_task_clip/` with a `hands_wilor.hdf5` file and a matching `hands_wilor.mp4` link to the original video.
+- Each video has a directory such as `00001_task_clip/` with a `hands_wilor.hdf5` file and a matching `hands_wilor.mp4` link to the original video. Pass the HDF5 to `scripts/retarget.sh`.
 - `results.csv` lists the processing status and the paths to the annotated video and HDF5 for each input.
 
 > [!TIP]
@@ -99,8 +100,8 @@ By default, each run writes to `outputs/wilor_output/parallel_<run_id>/`.
 >
 > - **Temporal refinement** defaults to off. Set `dynhamr_enabled: true` to enable SAM 3 hand masking and DynHaMR/HMP refinement.
 > - **Minimum per-hand frame coverage** is controlled by `min_hand_detection_rate` in basic mode. Each hand must meet the threshold independently before and after filtering. The default `0.10` requires detections in at least 10% of the clip's frames. Set `0.20` to require 20%.
-> - **Multi-GPU scheduling** uses physical GPU indices. With refinement off, `split.profiles.basic` assigns `camera_gpus` to DA3 and `wilor_gpus` to WiLoR. With refinement on, `split.profiles.refined` also assigns `mask_gpus` to SAM 3 and `optimizer_gpus` to DynHaMR/HMP. GPU lists must be disjoint within each profile.
-> - **Batch paths** are configured with `split.input_dir` and `split.output_root`. Set `SPLIT_CONFIG` when launching the batch script to use a separate experiment YAML.
+> - **Multi-GPU scheduling** uses physical GPU indices. With refinement off, `split.profiles.basic` assigns `camera_gpus` to DA3 and `wilor_gpus` to WiLoR. With refinement on, `split.profiles.refined` also assigns `mask_gpus` to SAM 3 and `optimizer_gpus` to DynHaMR/HMP. GPU lists must be disjoint within each profile. DA3 and WiLoR can process the same video concurrently.
+> - **Batch paths** are configured with `split.input_dir` and `split.output_root`. Set `split.max_videos` to limit the run to the first N videos, or use `0` to process all videos.
 
 ## Run a Corpus
 

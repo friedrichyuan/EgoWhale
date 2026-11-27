@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# 独立运行手部节点：仅 MP4 -> DA3 + Path B；有标注的 HDF5 直接输入 Retarget。
-# 用法：bash scripts/wilor.sh <input.mp4> [out_dir]
+# 读取仓库的 wilor.yaml，启动 WiLoR 分卡批处理。
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GPU_ID="${GPU_ID:-0}" # 修改 GPU 编号，也可通过环境变量设置
-PYTHON="${EGOWHALE_PYTHON:-$ROOT/../.conda-egohand/bin/python}"
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-    echo "用法：bash scripts/wilor.sh <input.mp4> [out_dir]" >&2
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG="$ROOT/egowhale/wilor/cfgs/wilor.yaml"
+PYTHON="${EGOWHALE_PYTHON:-${MAIN_PYTHON:-$ROOT/../.conda-egohand/bin/python}}"
+
+if [[ $# -eq 1 && ( "$1" == "--help" || "$1" == "-h" ) ]]; then
+    echo "用法：bash scripts/wilor.sh [--dry-run]"
+    echo "配置文件：$CONFIG"
+    exit 0
+fi
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "--dry-run" ) ]]; then
+    echo "用法：bash scripts/wilor.sh [--dry-run]。运行参数请填写 $CONFIG" >&2
     exit 2
 fi
-INPUT="$1"
-TASK="$(basename "$(dirname "$INPUT")")"
-NAME="$(basename "${INPUT%.*}")"
-OUTPUT="${2:-$ROOT/outputs/$TASK/$NAME}"
-export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_ID" PYTHONUNBUFFERED=1
+
 cd "$ROOT"
-exec "$PYTHON" -m egowhale.wilor --video "$INPUT" --output "$OUTPUT" --python "$PYTHON"
+export PYTHONUNBUFFERED=1
+exec "$PYTHON" -u tools/split_wilor_batch.py --config "$CONFIG" --python "$PYTHON" "$@"

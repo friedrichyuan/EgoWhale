@@ -129,7 +129,8 @@ def windows(length: int, radius: int, step: int, max_refs: int, ref_stride: int 
     return out
 
 
-def _paint(model, clip: dict, radius: int, step: int, max_refs: int, fp16: bool) -> np.ndarray:
+def predict_native(model, clip: dict, radius: int = 10, step: int = 20, max_refs: int = 12, fp16: bool = True):
+    """Predict RGB in [0, 1] at the model resolution, before compositing."""
     import torch
     import torch.nn.functional as F
 
@@ -137,7 +138,6 @@ def _paint(model, clip: dict, radius: int, step: int, max_refs: int, fp16: bool)
     device = model["device"]
     frames, masks = clip["frames"][0], clip["masks"][0]
     length = frames.shape[0]
-    width, height = clip["out_size"]
     autocast = torch.autocast("cuda", dtype=torch.float16, enabled=fp16)
     with torch.no_grad():
         # Only the 432x240 copies stay on the GPU; full frames go over a chunk at a time, there and back.
@@ -169,8 +169,19 @@ def _paint(model, clip: dict, radius: int, step: int, max_refs: int, fp16: bool)
             count.index_add_(0, index, torch.ones(len(neighbors), device=device))
         if not bool((count > 0).all()):
             raise RuntimeError("STTN left a frame unpainted")
-        predicted = total / count.view(-1, 1, 1, 1)
-        del total, feats
+        return total / count.view(-1, 1, 1, 1)
+
+
+def _paint(model, clip: dict, radius: int, step: int, max_refs: int, fp16: bool) -> np.ndarray:
+    import torch
+    import torch.nn.functional as F
+
+    predicted = predict_native(model, clip, radius, step, max_refs, fp16)
+    frames, masks = clip["frames"][0], clip["masks"][0]
+    length = frames.shape[0]
+    width, height = clip["out_size"]
+    device = model["device"]
+    with torch.no_grad():
         out = np.empty((length, height, width, 3), dtype=np.uint8)
         for begin in range(0, length, _GPU_CHUNK):
             image = frames[begin : begin + _GPU_CHUNK].to(device, non_blocking=True).float().div_(255)
